@@ -22,8 +22,8 @@ export interface LoadedConfig {
   value: ServerConfig;
 }
 
-export async function loadConfig(path = process.env.AEGRA_CONFIG): Promise<LoadedConfig> {
-  const chosen = path ?? (existsSync("aegra.json") ? "aegra.json" : "langgraph.json");
+export async function loadConfig(path = process.env.VALIDA_CONFIG): Promise<LoadedConfig> {
+  const chosen = path ?? (existsSync("valida.json") ? "valida.json" : "langgraph.json");
   const absolute = resolve(chosen);
   const value = JSON.parse(await readFile(absolute, "utf8")) as ServerConfig;
   if (!value.graphs || typeof value.graphs !== "object" || Array.isArray(value.graphs)) {

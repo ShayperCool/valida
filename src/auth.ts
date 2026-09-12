@@ -58,11 +58,13 @@ function routeAction(method: string, path: string): { resource: string; action: 
   return { resource, action: "create" };
 }
 
-export function authMiddleware(provider: AuthProvider | null): MiddlewareHandler {
+export function authMiddleware(provider: AuthProvider | null, options: { protectCustomRoutes?: boolean } = {}): MiddlewareHandler {
   return async (context, next) => {
     if (!provider) return next();
     const path = new URL(context.req.url).pathname;
     if (["/health", "/ready", "/live", "/info", "/openapi.json"].includes(path)) return next();
+    const target = routeAction(context.req.method, path);
+    if (!target && !options.protectCustomRoutes) return next();
     let user: AuthUser;
     try {
       user = await provider.authenticate(context.req.raw);
@@ -72,7 +74,7 @@ export function authMiddleware(provider: AuthProvider | null): MiddlewareHandler
     if (!user || !user.identity || user.is_authenticated === false) {
       return context.json({ detail: "Unauthorized" }, 401);
     }
-    const target = routeAction(context.req.method, path);
+    context.set("principal", user);
     if (target && provider.authorize) {
       const decision = await provider.authorize(
         { user, ...target, permissions: user.permissions ?? [] },

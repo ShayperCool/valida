@@ -2,13 +2,13 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: aegra
-      POSTGRES_PASSWORD: aegra
-      POSTGRES_DB: aegra
+      POSTGRES_USER: valida
+      POSTGRES_PASSWORD: valida
+      POSTGRES_DB: valida
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aegra -d aegra"]
+      test: ["CMD-SHELL", "pg_isready -U valida -d valida"]
       interval: 3s
       retries: 20
 
@@ -26,7 +26,7 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 2026
-      DATABASE_URL: postgres://aegra:aegra@postgres:5432/aegra
+      DATABASE_URL: postgres://valida:valida@postgres:5432/valida
       REDIS_URL: redis://redis:6379
       EXECUTION_MODE: distributed
       RUN_WORKER_IN_API: "true"
@@ -41,7 +41,7 @@ services:
     command: ["bun", "src/worker.ts"]
     profiles: ["extra-workers"]
     environment:
-      DATABASE_URL: postgres://aegra:aegra@postgres:5432/aegra
+      DATABASE_URL: postgres://valida:valida@postgres:5432/valida
       REDIS_URL: redis://redis:6379
       EXECUTION_MODE: distributed
     depends_on:
