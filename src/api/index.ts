@@ -86,7 +86,7 @@ function sse(events: AsyncIterable<StreamEvent>, headers?: Record<string, string
   });
 }
 
-function validateRunPayload(payload: JsonRecord): void {
+function validateRunPayload(payload: JsonRecord, threadId: string | null): void {
   requiredString(payload.assistant_id, "assistant_id");
   const hasInput = payload.input !== undefined && payload.input !== null;
   const hasCommand = payload.command !== undefined && payload.command !== null;
@@ -94,7 +94,7 @@ function validateRunPayload(payload: JsonRecord): void {
     throw new ApiError(422, "Cannot specify both input and command");
   }
   if (hasInput && hasCommand) delete payload.input;
-  if (!hasInput && !hasCommand && payload.checkpoint == null && payload.checkpoint_id == null) {
+  if (threadId === null && !hasInput && !hasCommand && payload.checkpoint == null && payload.checkpoint_id == null) {
     throw new ApiError(422, "Must specify input, command, or checkpoint");
   }
 }
@@ -297,7 +297,7 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
 
   async function createRun(request: Request, threadId: string | null, requestContext: ApiRequestContext) {
     const payload = await body(request);
-    validateRunPayload(payload);
+    validateRunPayload(payload, threadId);
     return adapter.runs.create(threadId, payload, requestContext);
   }
 
