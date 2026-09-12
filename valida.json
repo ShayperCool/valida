@@ -1,0 +1,10 @@
+{
+  "graphs": {
+    "echo": "./examples/graphs.ts:echo",
+    "counter": "./examples/graphs.ts:counter",
+    "approval": "./examples/graphs.ts:approval"
+  },
+  "http": {
+    "cors": { "allow_origins": ["*"] }
+  }
+}

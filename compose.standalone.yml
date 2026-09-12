@@ -1,10 +1,10 @@
 services:
-  aegra:
+  valida:
     build: .
     environment:
       HOST: 0.0.0.0
       PORT: 2026
-      DATABASE_URL: file:./data/aegra.db
+      DATABASE_URL: file:./data/valida.db
       EXECUTION_MODE: standalone
     ports:
       - "2026:2026"
