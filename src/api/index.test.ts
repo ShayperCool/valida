@@ -135,6 +135,24 @@ describe("Agent Protocol HTTP compatibility", () => {
     expect(received.runPayload).toBeUndefined();
   });
 
+  test("thread-scoped stream permits checkpoint regeneration without input", async () => {
+    const { app, received } = fixture();
+    const regenerate = await app.request("/threads/thread-1/runs/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ assistant_id: "agent" }),
+    });
+    expect(regenerate.status).toBe(200);
+    expect((await regenerate.text())).toContain("event: values");
+    expect(received.runPayload).toEqual({ assistant_id: "agent" });
+    const stateless = await app.request("/runs/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ assistant_id: "agent" }),
+    });
+    expect(stateless.status).toBe(422);
+  });
+
   test("SDK thread-scoped v2 stream receives values through the legacy bridge", async () => {
     const { app, client, received } = fixture();
     const thread = client.threads.stream("thread-1", {
