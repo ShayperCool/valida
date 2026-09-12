@@ -5,8 +5,11 @@ export interface Assistant extends JsonRecord {
   assistant_id: string;
   graph_id: string;
   name: string;
+  description?: string | null;
   config: JsonRecord;
+  context?: JsonRecord;
   metadata: JsonRecord;
+  version?: number;
   created_at: string;
   updated_at: string;
 }
