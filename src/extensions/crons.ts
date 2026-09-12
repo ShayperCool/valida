@@ -5,6 +5,7 @@ import type { GraphRuntime } from "../engine/index.ts";
 import type { ApiRequestContext, JsonRecord, PlatformAdapter } from "../api/types.ts";
 import { ApiError } from "../api/types.ts";
 import { currentUser } from "../auth.ts";
+import { createRelation } from "./ddl.ts";
 
 type CronBackend = NonNullable<PlatformAdapter["crons"]>;
 type Row = Record<string, unknown>;
@@ -74,7 +75,7 @@ const apiRun = (run: RunRecord): JsonRecord => ({
 
 /** Persisted cron records with per-fire leases shared by SQLite or PostgreSQL instances. */
 export async function createCronExtension(store: Store, runtime: GraphRuntime): Promise<CronExtension> {
-  await store.exec(sql.raw(`CREATE TABLE IF NOT EXISTS valida_crons (
+  await createRelation(store, "valida_crons", `CREATE TABLE IF NOT EXISTS valida_crons (
     cron_id TEXT PRIMARY KEY,
     assistant_id TEXT NOT NULL,
     thread_id TEXT,
@@ -89,8 +90,9 @@ export async function createCronExtension(store: Store, runtime: GraphRuntime): 
     lease_until TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
-  )`));
-  await store.exec(sql.raw("CREATE INDEX IF NOT EXISTS valida_crons_due ON valida_crons (enabled, next_run_at, lease_until)"));
+  )`);
+  await createRelation(store, "valida_crons_due",
+    "CREATE INDEX IF NOT EXISTS valida_crons_due ON valida_crons (enabled, next_run_at, lease_until)");
 
   async function find(id: string, context?: ApiRequestContext): Promise<Row | null> {
     const row = (await store.rows<Row>(sql`SELECT * FROM valida_crons WHERE cron_id = ${id} LIMIT 1`))[0] ?? null;
