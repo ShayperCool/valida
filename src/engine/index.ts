@@ -1,4 +1,4 @@
-import { Command } from "@langchain/langgraph";
+import { Command, type ProtocolEvent } from "@langchain/langgraph";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store } from "../db/index.js";
 import { RunQueue, type QueueConfig } from "../queue/index.js";
@@ -24,6 +24,7 @@ export interface GraphDefinition {
 export interface CompiledGraphLike {
   checkpointer?: BaseCheckpointSaver | boolean;
   stream(input: unknown, config: JsonObject): AsyncIterable<unknown> | Promise<AsyncIterable<unknown>>;
+  streamEvents?(input: any, options: any): AsyncIterable<ProtocolEvent> | Promise<AsyncIterable<ProtocolEvent>>;
   getState(config: JsonObject): Promise<any>;
   getStateHistory?(config: JsonObject, options?: { limit?: number }): AsyncIterable<any>;
   updateState?(config: JsonObject, values: unknown, asNode?: string): Promise<unknown>;
@@ -39,6 +40,7 @@ export interface ResumeRunOptions {
   assistantId?: string | null; config?: JsonObject; metadata?: JsonObject;
 }
 export interface StreamOptions { after?: number; pollMs?: number; signal?: AbortSignal }
+export interface V2RecordedEvent { id: string; event: ProtocolEvent }
 export interface GraphCheckpointConfig extends JsonObject { thread_id: string; checkpoint_id?: string; checkpoint_ns?: string }
 export interface GraphStateSnapshot {
   values: State; next: string[]; tasks: unknown[]; interrupts: unknown[];
@@ -91,6 +93,10 @@ export class GraphRuntime {
 
   listGraphs(): string[] { return [...this.graphs.keys()]; }
   hasGraph(id: string): boolean { return this.graphs.has(id); }
+  supportsV2(id: string): boolean {
+    const entry = this.graphs.get(id);
+    return entry?.kind === "compiled" && typeof entry.graph.streamEvents === "function";
+  }
   getGraph(id: string): GraphDefinition | CompiledGraphLike | null { return this.graphs.get(id)?.graph ?? null; }
 
   createThread(value: { id?: string; metadata?: JsonObject } = {}) { return this.store.createThread(value); }
@@ -337,11 +343,31 @@ export class GraphRuntime {
     const native = recovering ? await this.checkpointer.getTuple({ configurable: { thread_id: run.threadId } }) : undefined;
     const resumeNative = native && native.checkpoint.ts >= run.createdAt;
     const input = run.metadata.__resumeProvided === true ? new Command({ resume: run.resume }) : resumeNative ? null : run.input;
-    for await (const chunk of await graph.stream(input, config)) {
-      const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
-      await this.store.appendEvent(run.id, mode, toWire(data));
-      await this.store.renewRun(run.id);
-      if ((await this.store.getRun(run.id))?.status === "cancelled") return;
+    if (graph.streamEvents) {
+      const native = await graph.streamEvents(input, { ...config, version: "v3" });
+      for await (const event of native) {
+        const wire = toWire(event) as ProtocolEvent;
+        await this.store.appendEvent(run.id, "v2", wire);
+        const data = wire.params.data;
+        if (wire.params.namespace.length === 0 && wire.method === "updates") {
+          const update = isObject(data) && typeof data.node === "string"
+            ? { [data.node]: data.values } : data;
+          await this.store.appendEvent(run.id, "updates", update);
+        } else if (wire.params.namespace.length === 0 && wire.method === "values") {
+          await this.store.appendEvent(run.id, "values", data);
+        } else if (["custom", "tools", "checkpoints", "tasks"].includes(wire.method)) {
+          await this.store.appendEvent(run.id, wire.method, data);
+        }
+        await this.store.renewRun(run.id);
+        if ((await this.store.getRun(run.id))?.status === "cancelled") return;
+      }
+    } else {
+      for await (const chunk of await graph.stream(input, config)) {
+        const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
+        await this.store.appendEvent(run.id, mode, toWire(data));
+        await this.store.renewRun(run.id);
+        if ((await this.store.getRun(run.id))?.status === "cancelled") return;
+      }
     }
     const latestConfigurable: JsonObject = { ...configurable };
     delete latestConfigurable.checkpoint_id;
@@ -355,6 +381,7 @@ export class GraphRuntime {
       step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
       parentId: previous?.id ?? null });
     const status = interrupts.length || next.length ? "interrupted" : "success";
+    if (interrupts.length) await this.store.appendEvent(run.id, "updates", { __interrupt__: interrupts });
     await this.store.updateRun(run.id, { status, output: values, leaseUntil: null });
     await this.store.updateThread(run.threadId, { status: status === "success" ? "idle" : "interrupted" });
     await this.store.appendEvent(run.id, "end", { status, output: values });
@@ -394,7 +421,22 @@ export class GraphRuntime {
       const batch = await this.store.listEvents(runId, after);
       for (const item of batch) {
         after = item.seq;
-        yield { event: item.event, data: item.data, id: String(item.seq) };
+        if (item.event !== "v2") yield { event: item.event, data: item.data, id: String(item.seq) };
+      }
+      const run = await this.store.getRun(runId);
+      if (!run || (completed.has(run.status) && batch.length === 0)) return;
+      await sleep(options.pollMs ?? 100);
+    }
+  }
+  /** Replay and follow native LangGraph v3 protocol envelopes for one run. */
+  async *streamV2(runId: string, options: StreamOptions = {}): AsyncGenerator<V2RecordedEvent> {
+    let after = options.after ?? 0;
+    for (;;) {
+      if (options.signal?.aborted) return;
+      const batch = await this.store.listEvents(runId, after);
+      for (const item of batch) {
+        after = item.seq;
+        if (item.event === "v2") yield { id: String(item.seq), event: item.data as ProtocolEvent };
       }
       const run = await this.store.getRun(runId);
       if (!run || (completed.has(run.status) && batch.length === 0)) return;
