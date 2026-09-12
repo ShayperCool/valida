@@ -136,6 +136,22 @@ describe("custom auth middleware", () => {
     expect(await response.json()).toEqual({ owner: "alice" });
   });
 
+  test("does not invent a JSON payload for a bodyless write", async () => {
+    const local = new Hono();
+    local.use("*", authMiddleware({
+      authenticate: provider.authenticate,
+      authorize() { return { metadata: { authorized: true } }; },
+    }));
+    local.post("/threads/:threadId/copy", c => c.json({
+      payload: currentAuthorization.getStore()?.payload,
+      value: currentAuthorization.getStore()?.value,
+    }));
+    const response = await local.request("/threads/t-1/copy", {
+      method: "POST", headers: credential,
+    });
+    expect(await response.json()).toEqual({ payload: null, value: { thread_id: "t-1" } });
+  });
+
   test("does not leak authorization data between concurrent requests", async () => {
     const local = new Hono();
     local.use("*", authMiddleware({

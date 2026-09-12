@@ -207,7 +207,7 @@ export function authMiddleware(provider: AuthProvider | null, options: { protect
     const replacement = isRecord(decision) ? decision : null;
     const state: AuthorizationState = {
       ...authContext, value,
-      payload: target && isWrite(target.action) ? replacement ?? value : null,
+      payload: target && isWrite(target.action) && requestBody !== null ? replacement ?? value : null,
       filter: target && !isWrite(target.action) ? replacement : null,
     };
     return currentUser.run(user, () => currentAuthorization.run(state, next));
