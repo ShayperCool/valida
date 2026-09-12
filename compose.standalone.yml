@@ -1,0 +1,15 @@
+services:
+  aegra:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      PORT: 2026
+      DATABASE_URL: file:./data/aegra.db
+      EXECUTION_MODE: standalone
+    ports:
+      - "2026:2026"
+    volumes:
+      - standalone_data:/app/data
+
+volumes:
+  standalone_data:
