@@ -53,4 +53,6 @@ When `queue` is set, `startRun` and `resumeRun` enqueue durable BullMQ jobs. API
 
 `runtime.store` exposes assistant, thread, run, checkpoint, and event repository methods. `runtime.stream(runId, { after })` replays stored events and follows a live run. Event names include `metadata`, `run`, `updates`, `values`, `error`, and `end`. `runtime.getHistory(threadId)` returns persisted snapshots. `runtime.updateState(threadId, values, asNode?)` updates both the API snapshot and the native LangGraph checkpoint for compiled graphs.
 
+Compiled graph events, API snapshots, and run output convert LangChain message instances to Agent Protocol objects such as `{ type: "ai", content: "Hello", id: "..." }`. The native LangGraph checkpoint retains its typed message objects for subsequent graph execution.
+
 Drizzle schemas live in `src/db/schema.sqlite.ts` and `src/db/schema.pg.ts`. Startup `Store.migrate()` creates the baseline tables for both dialects. Generate versioned SQL migrations with `bunx drizzle-kit generate --config drizzle.sqlite.config.ts` and `bunx drizzle-kit generate --config drizzle.pg.config.ts` after schema changes. The runtime needs `drizzle-orm`, `postgres`, `bullmq`, `ioredis`, `@langchain/core`, `@langchain/langgraph`, and `@langchain/langgraph-checkpoint` as direct dependencies.
