@@ -79,11 +79,11 @@ function fixture() {
   };
   const app = createApi(adapter);
   const client = new Client({
-    apiUrl: "http://aegra.test",
+    apiUrl: "http://valida.test",
     apiKey: null,
     callerOptions: {
       maxRetries: 0,
-      fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)),
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch,
     },
   });
   return { app, client, received };
@@ -133,5 +133,24 @@ describe("Agent Protocol HTTP compatibility", () => {
     });
     expect(response.status).toBe(422);
     expect(received.runPayload).toBeUndefined();
+  });
+
+  test("SDK thread-scoped v2 stream receives values through the legacy bridge", async () => {
+    const { app, client, received } = fixture();
+    const thread = client.threads.stream("thread-1", {
+      assistantId: "agent",
+      maxReconnectAttempts: 0,
+      streamIdleReconnect: 0,
+      fetch: ((input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init))) as typeof fetch,
+    });
+    try {
+      await thread.run.start({ input: { value: 1 } });
+      expect(await thread.values).toMatchObject({ messages: [{ type: "ai", content: "done" }] });
+      expect(received.runPayload?.input).toEqual({ value: 1 });
+      await thread.input.respond({ interrupt_id: "interrupt-1", namespace: [], response: "approved" });
+      expect(received.runPayload?.command).toEqual({ resume: "approved" });
+    } finally {
+      await thread.close();
+    }
   });
 });
