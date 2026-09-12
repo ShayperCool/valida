@@ -65,6 +65,9 @@ export async function seedDefaultAssistants(store: Store, graphIds: string[]): P
 
 export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, graphIds: string[]): PlatformAdapter {
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
+  async function threadWithValues(row: ThreadRecord): Promise<Thread> {
+    return { ...apiThread(row), values: (await store.getState(row.id))?.values ?? {} };
+  }
   async function getRun(id: string, threadId: string | null) {
     const result = await runtime.getRun(id);
     if (!result || (threadId && result.threadId !== threadId)) return null;
@@ -136,21 +139,21 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
           id: typeof payload.thread_id === "string" ? payload.thread_id : undefined,
           metadata,
         });
-        return apiThread(row);
+        return threadWithValues(row);
       },
       async search(query) {
         const rows = await store.listThreads(100_000);
         const filtered = rows.filter(row => visible(row) &&
           (!query.status || row.status === query.status) &&
           matchesMetadata(row.metadata, object(query.metadata)));
-        return filtered.slice(number(query.offset, 0), number(query.offset, 0) + number(query.limit, 10)).map(apiThread);
+        return Promise.all(filtered.slice(number(query.offset, 0), number(query.offset, 0) + number(query.limit, 10)).map(threadWithValues));
       },
-      async get(id) { const row = await getThread(id); return row ? apiThread(row) : null; },
+      async get(id) { const row = await getThread(id); return row ? threadWithValues(row) : null; },
       async update(id, payload) {
         const row = await getThread(id);
         if (!row) return null;
         const updated = await store.updateThread(id, { metadata: { ...row.metadata, ...object(payload.metadata) } });
-        return updated ? apiThread(updated) : null;
+        return updated ? threadWithValues(updated) : null;
       },
       async delete(id) {
         if (!await getThread(id)) return false;
@@ -185,7 +188,7 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
         const created = await store.createThread({ metadata: original.metadata });
         const state = await store.getState(id);
         if (state) await store.createCheckpoint({ ...state, id: undefined, threadId: created.id, parentId: null });
-        return apiThread(created);
+        return threadWithValues(created);
       },
     },
     runs: {
@@ -195,6 +198,9 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
         if (!assistant) throw new ApiError(404, `Assistant '${assistantId}' not found`);
         const thread = threadId ? await getThread(threadId) : await store.createThread({ metadata: { _ephemeral: true } });
         if (!thread) throw new ApiError(404, `Thread '${threadId}' not found`);
+        await store.updateThread(thread.id, { metadata: {
+          ...thread.metadata, graph_id: assistant.graphId, assistant_id: assistantId,
+        } });
         const command = object(payload.command);
         const resumed = payload.command != null || (payload.input && object(payload.input).respond !== undefined);
         const run = resumed
