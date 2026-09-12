@@ -154,7 +154,7 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
     return json(await adapter.assistants.create(payload, ctx(c)));
   });
   app.get("/assistants", async (c) => {
-    const assistants = await adapter.assistants.search({}, ctx(c));
+    const assistants = await adapter.assistants.search({ limit: 1_000_000, offset: 0 }, ctx(c));
     return json({ assistants, total: assistants.length });
   });
   app.post("/assistants/search", async (c) => {
@@ -225,7 +225,7 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
 
   app.post("/threads", async (c) => json(await adapter.threads.create(await body(c.req.raw), ctx(c))));
   app.get("/threads", async (c) => {
-    const threads = await adapter.threads.search(query(c.req.raw), ctx(c));
+    const threads = await adapter.threads.search({ ...query(c.req.raw), limit: 1_000_000, offset: 0 }, ctx(c));
     return json({ threads, total: threads.length });
   });
   app.post("/threads/search", async (c) => json(await adapter.threads.search(await body(c.req.raw), ctx(c))));
