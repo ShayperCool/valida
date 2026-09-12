@@ -68,6 +68,12 @@ test("compiled StateGraph uses durable checkpointer for interrupt and resume", a
   const thread = await runtime.createThread();
   const first = await runtime.startRun({ threadId: thread.id, graphId: "langgraph", input: { value: 1 } });
   expect((await runtime.waitRun(first.id)).status).toBe("interrupted");
+  const v2 = [];
+  for await (const item of runtime.streamV2(first.id)) v2.push(item.event);
+  expect(v2.some(event => event.method === "input.requested" &&
+    (event.params.data as { payload?: unknown }).payload === "approve")).toBe(true);
+  expect(v2.at(-1)?.method).toBe("lifecycle");
+  expect((v2.at(-1)?.params.data as { event?: string }).event).toBe("interrupted");
   await runtime.close(); open.splice(open.indexOf(runtime), 1);
   const resumedRuntime = await createRuntime({ db: { dialect: "sqlite", url } }); open.push(resumedRuntime);
   resumedRuntime.registerGraph({ id: "langgraph", graph: compile() });

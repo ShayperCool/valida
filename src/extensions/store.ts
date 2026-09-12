@@ -3,6 +3,7 @@ import type { Store } from "../db/index.ts";
 import type { ApiRequestContext, JsonRecord, PlatformAdapter } from "../api/types.ts";
 import { ApiError } from "../api/types.ts";
 import { createRelation } from "./ddl.ts";
+import { matchesAuthorizationFilter } from "../authz.ts";
 
 type Row = Record<string, unknown>;
 type StoreBackend = NonNullable<PlatformAdapter["store"]>;
@@ -74,11 +75,16 @@ export async function createStoreExtension(store: Store): Promise<StoreBackend> 
         WHERE namespace = ${name} AND item_key = ${key} LIMIT 1`);
       const row = rows[0];
       if (!row || !active(row, now())) return null;
-      return item(row);
+      const result = item(row);
+      return matchesAuthorizationFilter("store", result) ? result : null;
     },
     async delete(ns: string[], key: string, _context?: ApiRequestContext): Promise<void> {
+      const name = JSON.stringify(namespace(ns));
+      const row = (await store.rows<Row>(sql`SELECT * FROM valida_store_items
+        WHERE namespace = ${name} AND item_key = ${key} LIMIT 1`))[0];
+      if (row && !matchesAuthorizationFilter("store", item(row))) throw new ApiError(403, "Store item access denied");
       await store.exec(sql`DELETE FROM valida_store_items
-        WHERE namespace = ${JSON.stringify(namespace(ns))} AND item_key = ${key}`);
+        WHERE namespace = ${name} AND item_key = ${key}`);
     },
     async search(payload: JsonRecord, _context?: ApiRequestContext): Promise<JsonRecord> {
       if (typeof payload.query === "string" && payload.query.length > 0) {
@@ -95,7 +101,8 @@ export async function createStoreExtension(store: Store): Promise<StoreBackend> 
         const candidate = JSON.parse(String(row.namespace)) as string[];
         if (!startsWith(candidate, prefix)) return false;
         const value = decode(row.item_value);
-        return Object.entries(filter).every(([key, expected]) => JSON.stringify(value[key]) === JSON.stringify(expected));
+        return matchesAuthorizationFilter("store", item(row)) &&
+          Object.entries(filter).every(([key, expected]) => JSON.stringify(value[key]) === JSON.stringify(expected));
       });
       return { items: matches.slice(offset, offset + limit).map(item), total: matches.length, limit, offset };
     },
@@ -111,6 +118,7 @@ export async function createStoreExtension(store: Store): Promise<StoreBackend> 
       const names = new Map<string, string[]>();
       for (const row of rows) {
         if (!active(row, stamp)) continue;
+        if (!matchesAuthorizationFilter("store", item(row))) continue;
         const parts = JSON.parse(String(row.namespace)) as string[];
         if (!startsWith(parts, prefix) || !endsWith(parts, suffix)) continue;
         const trimmed = maxDepth === null ? parts : parts.slice(0, maxDepth);

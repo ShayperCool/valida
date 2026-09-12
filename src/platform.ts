@@ -1,16 +1,21 @@
 import type { Store, AssistantRecord, ThreadRecord, RunRecord, CheckpointRecord } from "./db/index.ts";
 import { Overwrite } from "@langchain/langgraph";
 import type { GraphStateSnapshot } from "./engine/index.ts";
+import { describeGraph } from "./engine/introspection.ts";
 import type { PlatformAdapter, JsonRecord, Assistant, Thread, Run, ThreadState, Checkpoint } from "./api/types.ts";
 import { ApiError } from "./api/types.ts";
 import { currentUser } from "./auth.ts";
+import { matchesAuthorizationFilter } from "./authz.ts";
+import type { AssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 
 type RuntimeHandle = {
   startRun(input: {
     threadId: string; graphId: string; assistantId?: string;
     input?: unknown; config?: JsonRecord; metadata?: JsonRecord;
   }): Promise<RunRecord>;
-  resumeRun(input: { threadId: string; resume: unknown; graphId?: string }): Promise<RunRecord>;
+  resumeRun(input: { threadId: string; resume: unknown; graphId?: string;
+    assistantId?: string; config?: JsonRecord; metadata?: JsonRecord;
+    update?: JsonRecord; goto?: string | string[] }): Promise<RunRecord>;
   getRun(id: string): Promise<RunRecord | null>;
   stream(id: string, options?: { after?: number; pollMs?: number }): AsyncIterable<{ event: string; data: unknown; id: string }>;
   updateState(threadId: string, update: JsonRecord, asNode?: string): Promise<CheckpointRecord>;
@@ -60,7 +65,9 @@ const apiGraphState = (snapshot: GraphStateSnapshot): ThreadState => ({
 function owner(): string | undefined { return currentUser.getStore()?.identity; }
 function visible(record: ThreadRecord | null): boolean {
   const identity = owner();
-  return !record || !identity || !record.metadata._owner || record.metadata._owner === identity;
+  if (!record) return true;
+  if (identity && record.metadata._owner && record.metadata._owner !== identity) return false;
+  return matchesAuthorizationFilter("threads", apiThread(record));
 }
 function ensureVisible(record: ThreadRecord | null): ThreadRecord | null {
   if (!visible(record)) throw new ApiError(403, "Thread access denied");
@@ -78,7 +85,8 @@ export async function seedDefaultAssistants(store: Store, graphIds: string[]): P
 
 export function createPlatformAdapter(
   runtime: RuntimeHandle, store: Store, graphIds: string[],
-  extensions: { store?: PlatformAdapter["store"]; crons?: PlatformAdapter["crons"] } = {},
+  extensions: { store?: PlatformAdapter["store"]; crons?: PlatformAdapter["crons"];
+    versions?: AssistantVersionsExtension } = {},
 ): PlatformAdapter {
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
   async function threadWithValues(row: ThreadRecord): Promise<Thread> {
@@ -94,6 +102,9 @@ export function createPlatformAdapter(
     return await store.getAssistant(id) ?? (graphIds.includes(id)
       ? await store.createAssistant({ id, graphId: id, name: id }) : null);
   }
+  function assistantVisible(record: AssistantRecord): boolean {
+    return matchesAuthorizationFilter("assistants", apiAssistant(record));
+  }
 
   return {
     store: extensions.store,
@@ -108,46 +119,77 @@ export function createPlatformAdapter(
           description: typeof payload.description === "string" ? payload.description : null,
           config: object(payload.config), metadata: object(payload.metadata),
         });
-        return apiAssistant(created);
+        const assistant = { ...apiAssistant(created), context: object(payload.context) };
+        return extensions.versions ? extensions.versions.recordCreated(assistant) : assistant;
       },
       async search(query) {
         const rows = await store.listAssistants(100_000);
         const filtered = rows.filter(row =>
+          assistantVisible(row) &&
           (!query.graph_id || row.graphId === query.graph_id) &&
           (!query.name || row.name === query.name) &&
           matchesMetadata(row.metadata, object(query.metadata)),
         );
-        return filtered.slice(number(query.offset, 0), number(query.offset, 0) + number(query.limit, 10)).map(apiAssistant);
+        const selected = filtered.slice(number(query.offset, 0), number(query.offset, 0) + number(query.limit, 10)).map(apiAssistant);
+        return extensions.versions ? Promise.all(selected.map(assistant => extensions.versions!.decorate(assistant))) : selected;
       },
-      async get(id) { const row = await getAssistant(id); return row ? apiAssistant(row) : null; },
+      async get(id) {
+        const row = await getAssistant(id);
+        if (!row) return null;
+        if (!assistantVisible(row)) throw new ApiError(403, "Assistant access denied");
+        const assistant = apiAssistant(row);
+        return extensions.versions ? extensions.versions.decorate(assistant) : assistant;
+      },
       async update(id, payload) {
+        const previous = await getAssistant(id);
+        if (!previous) return null;
         const row = await store.updateAssistant(id, {
           name: typeof payload.name === "string" ? payload.name : undefined,
           description: typeof payload.description === "string" ? payload.description : undefined,
           config: payload.config === undefined ? undefined : object(payload.config),
           metadata: payload.metadata === undefined ? undefined : object(payload.metadata),
         });
-        return row ? apiAssistant(row) : null;
+        if (!row) return null;
+        const assistant = { ...apiAssistant(row),
+          context: payload.context === undefined ? undefined : object(payload.context) };
+        return extensions.versions
+          ? extensions.versions.recordUpdated(
+            await extensions.versions.decorate(apiAssistant(previous)), assistant,
+          ) : assistant;
       },
       async delete(id) {
-        if (!await store.getAssistant(id)) return false;
+        const existing = await store.getAssistant(id);
+        if (!existing) return false;
+        if (!assistantVisible(existing)) throw new ApiError(403, "Assistant access denied");
         await store.deleteAssistant(id);
+        await extensions.versions?.delete(id);
         return true;
       },
+      versions: extensions.versions ? async (id, query, context) => {
+        const row = await getAssistant(id);
+        if (!row) throw new ApiError(404, `Assistant '${id}' not found`);
+        if (!assistantVisible(row)) throw new ApiError(403, "Assistant access denied");
+        return extensions.versions!.versions(id, query, context);
+      } : undefined,
+      setLatest: extensions.versions?.setLatest,
       async graph(id) {
         const assistant = await getAssistant(id);
-        return assistant ? { nodes: [{ id: "__start__" }, { id: assistant.graphId }, { id: "__end__" }],
-          edges: [{ source: "__start__", target: assistant.graphId }, { source: assistant.graphId, target: "__end__" }] } : null;
+        const graph = assistant && runtime.getGraph?.(assistant.graphId);
+        return graph ? { ...describeGraph(graph).graph } : null;
       },
       async schemas(id) {
-        return await getAssistant(id) ? {
-          graph_id: id, input_schema: { type: "object", additionalProperties: true },
-          output_schema: { type: "object", additionalProperties: true },
-          state_schema: { type: "object", additionalProperties: true },
-          config_schema: { type: "object", additionalProperties: true },
-        } : null;
+        const assistant = await getAssistant(id);
+        const graph = assistant && runtime.getGraph?.(assistant.graphId);
+        return graph ? { graph_id: assistant.graphId, ...describeGraph(graph).schemas } : null;
       },
-      async subgraphs(id) { return await getAssistant(id) ? {} : null; },
+      async subgraphs(id, query) {
+        const assistant = await getAssistant(id);
+        const graph = assistant && runtime.getGraph?.(assistant.graphId);
+        if (!graph) return null;
+        const subgraphs = describeGraph(graph).subgraphs;
+        const namespace = typeof query.namespace === "string" ? query.namespace : undefined;
+        return namespace ? subgraphs[namespace] ?? null : subgraphs;
+      },
     },
     threads: {
       async create(payload) {
@@ -234,7 +276,10 @@ export function createPlatformAdapter(
         const checkpoint = object(payload.checkpoint);
         const checkpointId = typeof checkpoint.checkpoint_id === "string" ? checkpoint.checkpoint_id
           : typeof payload.checkpoint_id === "string" ? payload.checkpoint_id : undefined;
-        const config = object(payload.config);
+        const assistantConfig = object(assistant.config);
+        const requestedConfig = object(payload.config);
+        const config = { ...assistantConfig, ...requestedConfig,
+          configurable: { ...object(assistantConfig.configurable), ...object(requestedConfig.configurable) } };
         const runConfig = checkpointId
           ? { ...config, configurable: { ...object(config.configurable), checkpoint_id: checkpointId } }
           : config;
@@ -253,7 +298,14 @@ export function createPlatformAdapter(
           }
         }
         const run = resumed
-          ? await runtime.resumeRun({ threadId: thread.id, resume: command.resume ?? object(payload.input).respond, graphId: assistant.graphId })
+          ? await runtime.resumeRun({ threadId: thread.id,
+            resume: command.resume ?? object(payload.input).respond,
+            update: command.update === undefined ? undefined : object(command.update),
+            goto: typeof command.goto === "string" ||
+              (Array.isArray(command.goto) && command.goto.every(item => typeof item === "string"))
+              ? command.goto as string | string[] : undefined,
+            graphId: assistant.graphId, assistantId, config: runConfig,
+            metadata: object(payload.metadata) })
           : await runtime.startRun({ threadId: thread.id, graphId: assistant.graphId, assistantId,
             input: payload.input ?? {}, config: runConfig, metadata: object(payload.metadata) });
         return apiRun(run);
