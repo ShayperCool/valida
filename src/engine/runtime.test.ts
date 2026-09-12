@@ -1,7 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
 import { Annotation, END, interrupt, START, StateGraph } from "@langchain/langgraph";
-import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
 import { MessagesAnnotation } from "@langchain/langgraph";
+import { FakeStreamingChatModel } from "@langchain/core/utils/testing";
+import { tool } from "@langchain/core/tools";
+import { z } from "zod";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -170,4 +173,58 @@ test("native checkpoint history supports editing the first human turn", async ()
   expect((await runtime.waitRun(refresh.id)).status).toBe("success");
   expect(((await runtime.getGraphState(thread.id))?.values.messages as Array<{ content: string }>).map(message => message.content))
     .toEqual(["first", "Echo: first"]);
+});
+
+test("v2 stream persists native content-block token events without a remote model", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" } }); open.push(runtime);
+  const model = new FakeStreamingChatModel({ chunks: [new AIMessageChunk("He"), new AIMessageChunk("llo")] });
+  const graph = new StateGraph(MessagesAnnotation)
+    .addNode("reply", async state => ({ messages: [await model.invoke(state.messages)] }))
+    .addEdge(START, "reply").addEdge("reply", END).compile();
+  runtime.registerGraph({ id: "tokens", graph });
+  const thread = await runtime.createThread();
+  const run = await runtime.startRun({ threadId: thread.id, graphId: "tokens",
+    input: { messages: [new HumanMessage("hi")] } });
+  expect((await runtime.waitRun(run.id)).status).toBe("success");
+  const events = [];
+  for await (const item of runtime.streamV2(run.id)) events.push(item.event);
+  const deltas = events.filter(event => event.method === "messages" &&
+    (event.params.data as { event?: string }).event === "content-block-delta");
+  expect(deltas.map(event => (event.params.data as { delta: { text: string } }).delta.text)).toEqual(["He", "llo"]);
+  expect(deltas.every(event => event.params.namespace.length > 0 && event.params.node === "reply")).toBe(true);
+  expect(events.some(event => event.method === "lifecycle" &&
+    (event.params.data as { event?: string }).event === "completed")).toBe(true);
+  expect(events.some(event => event.method === "checkpoints")).toBe(true);
+  const legacy = await runtime.store.listEvents(run.id);
+  expect(legacy.some(event => event.event === "values")).toBe(true);
+  const legacyStream = [];
+  for await (const item of runtime.stream(run.id)) legacyStream.push(item.event);
+  expect(legacyStream).not.toContain("v2");
+  expect(((await runtime.getState(thread.id))?.values.messages as Array<{ content: Array<{ type: string; text: string }> }>).at(-1)?.content)
+    .toEqual([{ type: "text", text: "Hello" }]);
+});
+
+test("v2 stream keeps native tool lifecycle and subgraph namespaces", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" } }); open.push(runtime);
+  const state = Annotation.Root({ n: Annotation<number>, result: Annotation<string> });
+  const add = tool(async ({ a, b }) => String(a + b), {
+    name: "add", description: "Add two numbers", schema: z.object({ a: z.number(), b: z.number() }),
+  });
+  const child = new StateGraph(state)
+    .addNode("calculate", async input => ({ n: input.n + 1, result: await add.invoke({ a: input.n, b: 1 }) }))
+    .addEdge(START, "calculate").addEdge("calculate", END).compile();
+  const graph = new StateGraph(state)
+    .addNode("child", child).addEdge(START, "child").addEdge("child", END).compile();
+  runtime.registerGraph({ id: "nested", graph });
+  const thread = await runtime.createThread();
+  const run = await runtime.startRun({ threadId: thread.id, graphId: "nested", input: { n: 2 } });
+  expect((await runtime.waitRun(run.id)).status).toBe("success");
+  const events = [];
+  for await (const item of runtime.streamV2(run.id)) events.push(item.event);
+  expect(events.some(event => event.method === "tools" &&
+    (event.params.data as { event?: string }).event === "tool-started")).toBe(true);
+  expect(events.some(event => event.method === "tools" &&
+    (event.params.data as { event?: string }).event === "tool-finished")).toBe(true);
+  expect(events.some(event => event.params.namespace[0]?.startsWith("child:"))).toBe(true);
+  expect((await runtime.getGraphState(thread.id))?.values).toMatchObject({ n: 3, result: "3" });
 });
