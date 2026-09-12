@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import type { Store } from "../db/index.ts";
 import type { ApiRequestContext, JsonRecord, PlatformAdapter } from "../api/types.ts";
 import { ApiError } from "../api/types.ts";
+import { createRelation } from "./ddl.ts";
 
 type Row = Record<string, unknown>;
 type StoreBackend = NonNullable<PlatformAdapter["store"]>;
@@ -35,7 +36,7 @@ const endsWith = (parts: string[], suffix: string[]) => suffix.every((part, inde
 
 /** Durable exact-key JSON store. Semantic vector search needs a separately configured index. */
 export async function createStoreExtension(store: Store): Promise<StoreBackend> {
-  await store.exec(sql.raw(`CREATE TABLE IF NOT EXISTS valida_store_items (
+  await createRelation(store, "valida_store_items", `CREATE TABLE IF NOT EXISTS valida_store_items (
     namespace TEXT NOT NULL,
     item_key TEXT NOT NULL,
     item_value TEXT NOT NULL,
@@ -43,8 +44,9 @@ export async function createStoreExtension(store: Store): Promise<StoreBackend> 
     updated_at TEXT NOT NULL,
     expires_at TEXT,
     PRIMARY KEY (namespace, item_key)
-  )`));
-  await store.exec(sql.raw("CREATE INDEX IF NOT EXISTS valida_store_items_expires ON valida_store_items (expires_at)"));
+  )`);
+  await createRelation(store, "valida_store_items_expires",
+    "CREATE INDEX IF NOT EXISTS valida_store_items_expires ON valida_store_items (expires_at)");
 
   return {
     async put(payload: JsonRecord, _context?: ApiRequestContext): Promise<void> {
