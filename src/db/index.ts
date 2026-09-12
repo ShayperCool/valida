@@ -117,7 +117,17 @@ export class Store {
       `CREATE INDEX IF NOT EXISTS checkpoints_thread_created ON checkpoints (thread_id, created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS lg_checkpoints_latest ON lg_checkpoints (thread_id, checkpoint_ns, checkpoint_id DESC)`,
     ];
-    for (const statement of statements) await this.exec(sql.raw(statement));
+    if (this.pgDb) {
+      // CREATE INDEX IF NOT EXISTS is still racy across concurrent PostgreSQL
+      // connections: both can pass the existence check before either commits.
+      await this.pgDb.transaction(async tx => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(${0x56414c49}, ${1})`);
+        await tx.execute(sql.raw("SET LOCAL client_min_messages TO warning"));
+        for (const statement of statements) await tx.execute(sql.raw(statement));
+      });
+    } else {
+      for (const statement of statements) await this.exec(sql.raw(statement));
+    }
   }
 
   async close(): Promise<void> { this.sqlite?.close(); await this.pg?.end(); }
@@ -192,12 +202,18 @@ export class Store {
   async listRuns(threadId: string, limit = 100): Promise<RunRecord[]> {
     return (await this.rows(sql`SELECT * FROM runs WHERE thread_id = ${threadId} ORDER BY created_at DESC LIMIT ${limit}`)).map(run);
   }
+  async listRunnableRuns(limit = 100): Promise<RunRecord[]> {
+    const stamp = now();
+    return (await this.rows(sql`SELECT * FROM runs WHERE status = ${"pending"}
+      OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp}))
+      ORDER BY created_at ASC LIMIT ${limit}`)).map(run);
+  }
   async claimRun(id: string, leaseMs = 60_000): Promise<boolean> {
     const until = new Date(Date.now() + leaseMs).toISOString(), stamp = now();
-    await this.exec(sql`UPDATE runs SET status = ${"running"}, lease_until = ${until}, updated_at = ${stamp}
-      WHERE id = ${id} AND (status = ${"pending"} OR (status = ${"running"} AND lease_until < ${stamp}))`);
-    const current = await this.getRun(id);
-    return current?.status === "running" && current.leaseUntil === until;
+    const claimed = await this.rows<{ id: string }>(sql`UPDATE runs SET status = ${"running"}, lease_until = ${until}, updated_at = ${stamp}
+      WHERE id = ${id} AND (status = ${"pending"} OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp})))
+      RETURNING id`);
+    return claimed.length === 1;
   }
   async renewRun(id: string, leaseMs = 60_000): Promise<void> {
     await this.exec(sql`UPDATE runs SET lease_until = ${new Date(Date.now() + leaseMs).toISOString()}, updated_at = ${now()} WHERE id = ${id} AND status = ${"running"}`);

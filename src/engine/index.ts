@@ -52,6 +52,8 @@ export class GraphRuntime {
   readonly checkpointer: DrizzleCheckpointer;
   private readonly queue?: RunQueue;
   private readonly inline: boolean;
+  private readonly active = new Set<string>();
+  private readonly recoveryTimer?: ReturnType<typeof setInterval>;
   private readonly graphs = new Map<string, { kind: "custom"; graph: GraphDefinition } | { kind: "compiled"; graph: CompiledGraphLike }>();
 
   constructor(store: Store, config: Omit<RuntimeConfig,"db"> = {}) {
@@ -59,18 +61,24 @@ export class GraphRuntime {
     this.checkpointer = new DrizzleCheckpointer(store);
     this.queue = config.queue ? new RunQueue(config.queue) : undefined;
     this.inline = config.inline ?? !config.queue;
+    if (this.inline) {
+      this.recoveryTimer = setInterval(() => { void this.recoverPendingRuns(); }, 5_000);
+      this.recoveryTimer.unref?.();
+    }
   }
 
   registerGraph(definition: GraphDefinition | CompiledGraphDefinition): void {
     if ("nodes" in definition) {
       if (!definition.nodes[definition.entrypoint]) throw new Error(`Graph ${definition.id}: entrypoint ${definition.entrypoint} is missing`);
       this.graphs.set(definition.id, { kind: "custom", graph: definition });
+      if (this.inline) queueMicrotask(() => { void this.recoverPendingRuns(); });
       return;
     }
     const graph = typeof definition.graph === "function" ? definition.graph(this.checkpointer) : definition.graph;
     // CompiledStateGraph exposes this property, even when compiled without a saver.
     graph.checkpointer = this.checkpointer;
     this.graphs.set(definition.id, { kind: "compiled", graph });
+    if (this.inline) queueMicrotask(() => { void this.recoverPendingRuns(); });
   }
 
   listGraphs(): string[] { return [...this.graphs.keys()]; }
@@ -132,20 +140,43 @@ export class GraphRuntime {
     this.queue.start(runId => this.executeRun(runId));
   }
 
-  async executeRun(runId: string): Promise<void> {
-    if (!await this.store.claimRun(runId)) return;
-    const run = await this.store.getRun(runId);
-    if (!run) return;
-    const registered = this.graphs.get(run.graphId);
-    if (!registered) {
-      await this.fail(run, new Error(`Graph ${run.graphId} is not registered in this worker`));
-      return;
+  async recoverPendingRuns(): Promise<void> {
+    if (!this.inline) return;
+    for (const run of await this.store.listRunnableRuns()) {
+      if (this.graphs.has(run.graphId) && !this.active.has(run.id)) {
+        void this.executeRun(run.id).catch(() => {});
+      }
     }
-    await this.store.appendEvent(run.id, "run", { status: "running" });
+  }
+
+  async executeRun(runId: string): Promise<void> {
+    if (this.active.has(runId)) return;
+    this.active.add(runId);
     try {
-      if (registered.kind === "custom") await this.executeCustom(run, registered.graph);
-      else await this.executeCompiled(run, registered.graph);
-    } catch (error) { await this.fail(run, error); }
+      let recovering = false;
+      for (;;) {
+        const before = await this.store.getRun(runId);
+        if (!before || completed.has(before.status)) return;
+        recovering = before.status === "running";
+        if (await this.store.claimRun(runId)) break;
+        // A stalled BullMQ job may be retried before its database lease expires.
+        // Keep the replacement job alive until the owner finishes or the lease expires.
+        const remaining = before.leaseUntil ? Date.parse(before.leaseUntil) - Date.now() : 0;
+        await sleep(Math.min(Math.max(remaining + 20, 100), 5_000));
+      }
+      const run = await this.store.getRun(runId);
+      if (!run) return;
+      const registered = this.graphs.get(run.graphId);
+      if (!registered) {
+        await this.fail(run, new Error(`Graph ${run.graphId} is not registered in this worker`));
+        return;
+      }
+      await this.store.appendEvent(run.id, "run", { status: "running", recovering });
+      try {
+        if (registered.kind === "custom") await this.executeCustom(run, registered.graph, recovering);
+        else await this.executeCompiled(run, registered.graph, recovering);
+      } catch (error) { await this.fail(run, error); }
+    } finally { this.active.delete(runId); }
   }
 
   private async fail(run: RunRecord, error: unknown): Promise<void> {
@@ -164,15 +195,16 @@ export class GraphRuntime {
     return next;
   }
 
-  private async executeCustom(run: RunRecord, graph: GraphDefinition): Promise<void> {
+  private async executeCustom(run: RunRecord, graph: GraphDefinition, recovering: boolean): Promise<void> {
     const previous = await this.store.getState(run.threadId);
     const resuming = run.metadata.__resumeProvided === true;
+    const continuing = recovering && previous?.runId === run.id;
     let values = previous?.values ?? {};
-    let next = resuming ? previous?.next ?? [] : [graph.entrypoint];
+    let next = resuming || continuing ? previous?.next ?? [] : [graph.entrypoint];
     let step = previous?.step ?? -1;
     let parentId = previous?.id ?? null;
-    if (!resuming) values = this.merge(values, stateOf(run.input), graph);
-    if (!previous || !resuming) {
+    if (!resuming && !continuing) values = this.merge(values, stateOf(run.input), graph);
+    if (!previous || (!resuming && !continuing)) {
       step++;
       const initial = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
         step, values, next, tasks: [], interrupts: [], parentId });
@@ -231,10 +263,12 @@ export class GraphRuntime {
     await this.store.appendEvent(run.id, "end", { status: "interrupted", output: values });
   }
 
-  private async executeCompiled(run: RunRecord, graph: CompiledGraphLike): Promise<void> {
+  private async executeCompiled(run: RunRecord, graph: CompiledGraphLike, recovering: boolean): Promise<void> {
     const configurable = { ...(isObject(run.config.configurable) ? run.config.configurable : {}), thread_id: run.threadId };
     const config = { ...run.config, configurable, streamMode: ["updates", "values"] };
-    const input = run.metadata.__resumeProvided === true ? new Command({ resume: run.resume }) : run.input;
+    const native = recovering ? await this.checkpointer.getTuple({ configurable: { thread_id: run.threadId } }) : undefined;
+    const resumeNative = native && native.checkpoint.ts >= run.createdAt;
+    const input = run.metadata.__resumeProvided === true ? new Command({ resume: run.resume }) : resumeNative ? null : run.input;
     for await (const chunk of await graph.stream(input, config)) {
       const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
       await this.store.appendEvent(run.id, mode, toWire(data));
@@ -297,7 +331,7 @@ export class GraphRuntime {
       await sleep(options.pollMs ?? 100);
     }
   }
-  async close(): Promise<void> { await this.queue?.close(); await this.store.close(); }
+  async close(): Promise<void> { if (this.recoveryTimer) clearInterval(this.recoveryTimer); await this.queue?.close(); await this.store.close(); }
 }
 
 export async function createRuntime(config: RuntimeConfig): Promise<GraphRuntime> {
