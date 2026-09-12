@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { ApiRequestContext, JsonRecord, PlatformAdapter, StreamEvent } from "./types";
 import { ApiError } from "./types";
+import { LegacyV2Bridge } from "./v2";
 
 type ApiEnv = { Variables: { principal: unknown } };
 
@@ -45,8 +46,9 @@ function query(request: Request): JsonRecord {
 function sse(events: AsyncIterable<StreamEvent>, headers?: Record<string, string>): Response {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      try {
+    start(controller) {
+      void (async () => {
+        try {
         for await (const chunk of events) {
           if (!chunk || typeof chunk.event !== "string") continue;
           const lines = [
@@ -59,7 +61,7 @@ function sse(events: AsyncIterable<StreamEvent>, headers?: Record<string, string
           controller.enqueue(encoder.encode(lines.join("\n")));
         }
         controller.close();
-      } catch (cause) {
+        } catch (cause) {
         // A streaming response has already sent its status. Report execution errors as SSE.
         try {
           controller.enqueue(
@@ -69,7 +71,8 @@ function sse(events: AsyncIterable<StreamEvent>, headers?: Record<string, string
         } catch {
           // The client disconnected.
         }
-      }
+        }
+      })();
     },
   });
   return new Response(stream, {
@@ -108,6 +111,7 @@ function notFound(kind: string, id: string): Response {
 /** Mount this Hono app behind custom middleware to provide authentication and HTTP extensions. */
 export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   const app = new Hono<ApiEnv>();
+  const v2 = adapter.v2 ?? new LegacyV2Bridge(adapter);
   const context = (request: Request, principal?: unknown): ApiRequestContext => ({ request, principal });
   const ctx = (c: { req: { raw: Request }; get: (key: "principal") => unknown }) =>
     context(c.req.raw, c.get("principal"));
@@ -135,11 +139,11 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   app.get("/info", async (c) =>
     json(
       (await adapter.info?.(ctx(c))) ?? {
-        name: "Aegra TypeScript",
+        name: "Valida",
         version: "0.1.0",
         description: "Self-hosted Agent Protocol server",
         status: "running",
-        flags: { assistants: true, v2_event_streaming: Boolean(adapter.v2) },
+        flags: { assistants: true, v2_event_streaming: true },
       },
     ),
   );
@@ -359,12 +363,14 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   });
 
   app.post("/threads/:threadId/commands", async (c) => {
-    if (!adapter.v2) return error(503, "Protocol v2 is not available");
-    return json(await adapter.v2.command(c.req.param("threadId"), await body(c.req.raw), ctx(c)));
+    return json(await v2.command(c.req.param("threadId"), await body(c.req.raw), ctx(c)));
   });
   app.post("/threads/:threadId/stream/events", async (c) => {
-    if (!adapter.v2) return error(503, "Protocol v2 is not available");
-    return sse(adapter.v2.events(c.req.param("threadId"), await body(c.req.raw), ctx(c)));
+    const payload = await body(c.req.raw);
+    if (!Array.isArray(payload.channels) || payload.channels.length === 0) {
+      throw new ApiError(400, "channels must be a non-empty array");
+    }
+    return sse(v2.events(c.req.param("threadId"), payload, ctx(c)));
   });
 
   app.put("/store/items", async (c) => {
