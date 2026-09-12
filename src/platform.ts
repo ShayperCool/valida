@@ -1,4 +1,6 @@
 import type { Store, AssistantRecord, ThreadRecord, RunRecord, CheckpointRecord } from "./db/index.ts";
+import { Overwrite } from "@langchain/langgraph";
+import type { GraphStateSnapshot } from "./engine/index.ts";
 import type { PlatformAdapter, JsonRecord, Assistant, Thread, Run, ThreadState, Checkpoint } from "./api/types.ts";
 import { ApiError } from "./api/types.ts";
 import { currentUser } from "./auth.ts";
@@ -12,6 +14,9 @@ type RuntimeHandle = {
   getRun(id: string): Promise<RunRecord | null>;
   stream(id: string, options?: { after?: number; pollMs?: number }): AsyncIterable<{ event: string; data: unknown; id: string }>;
   updateState(threadId: string, update: JsonRecord, asNode?: string): Promise<CheckpointRecord>;
+  getGraph?(id: string): unknown;
+  getGraphState?(threadId: string, checkpointId?: string, graphId?: string): Promise<GraphStateSnapshot | null>;
+  getGraphHistory?(threadId: string, limit?: number, graphId?: string): Promise<GraphStateSnapshot[]>;
 };
 
 const object = (value: unknown): JsonRecord =>
@@ -43,6 +48,14 @@ const apiState = (record: CheckpointRecord | null, threadId: string): ThreadStat
     ? { thread_id: threadId, checkpoint_id: record.parentId, checkpoint_ns: "" } : null,
   created_at: record?.createdAt ?? null,
 });
+const apiGraphState = (snapshot: GraphStateSnapshot): ThreadState => ({
+  values: snapshot.values, next: snapshot.next,
+  tasks: snapshot.tasks.map(object), interrupts: snapshot.interrupts.map(object),
+  metadata: snapshot.metadata,
+  checkpoint: snapshot.config as Checkpoint | null,
+  parent_checkpoint: snapshot.parentConfig as Checkpoint | null,
+  created_at: snapshot.createdAt,
+});
 
 function owner(): string | undefined { return currentUser.getStore()?.identity; }
 function visible(record: ThreadRecord | null): boolean {
@@ -63,7 +76,10 @@ export async function seedDefaultAssistants(store: Store, graphIds: string[]): P
   }
 }
 
-export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, graphIds: string[]): PlatformAdapter {
+export function createPlatformAdapter(
+  runtime: RuntimeHandle, store: Store, graphIds: string[],
+  extensions: { store?: PlatformAdapter["store"]; crons?: PlatformAdapter["crons"] } = {},
+): PlatformAdapter {
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
   async function threadWithValues(row: ThreadRecord): Promise<Thread> {
     return { ...apiThread(row), values: (await store.getState(row.id))?.values ?? {} };
@@ -80,6 +96,8 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
   }
 
   return {
+    store: extensions.store,
+    crons: extensions.crons,
     assistants: {
       async create(payload) {
         const graphId = String(payload.graph_id);
@@ -163,6 +181,10 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
       async getState(id, checkpoint) {
         if (!await getThread(id)) return null;
         const checkpointId = typeof checkpoint === "string" ? checkpoint : checkpoint?.checkpoint_id;
+        if (runtime.getGraphState) {
+          const native = await runtime.getGraphState(id, checkpointId);
+          if (native) return apiGraphState(native);
+        }
         const row = checkpointId ? await store.getCheckpoint(checkpointId) : await store.getState(id);
         return row && row.threadId !== id ? null : apiState(row, id);
       },
@@ -176,10 +198,16 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
             threadId: id, runId: crypto.randomUUID(), graphId: graphIds[0] ?? "unknown",
             step: 0, values: object(payload.values), next: [], tasks: [], interrupts: [], parentId: null,
           });
-        return { thread_id: id, checkpoint_id: row.id, checkpoint_ns: "" };
+        const native = await runtime.getGraphState?.(id);
+        return native?.config ? { ...native.config }
+          : { thread_id: id, checkpoint_id: row.id, checkpoint_ns: "" };
       },
       async history(id, query) {
         if (!await getThread(id)) return null;
+        if (runtime.getGraphHistory) {
+          const native = await runtime.getGraphHistory(id, number(query.limit, 10));
+          if (native.length) return native.map(apiGraphState);
+        }
         return (await store.getHistory(id, number(query.limit, 10))).map(row => apiState(row, id));
       },
       async copy(id) {
@@ -203,10 +231,31 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
         } });
         const command = object(payload.command);
         const resumed = payload.command != null || (payload.input && object(payload.input).respond !== undefined);
+        const checkpoint = object(payload.checkpoint);
+        const checkpointId = typeof checkpoint.checkpoint_id === "string" ? checkpoint.checkpoint_id
+          : typeof payload.checkpoint_id === "string" ? payload.checkpoint_id : undefined;
+        const config = object(payload.config);
+        const runConfig = checkpointId
+          ? { ...config, configurable: { ...object(config.configurable), checkpoint_id: checkpointId } }
+          : config;
+        if (!resumed && payload.input == null && !checkpointId) {
+          const latest = await store.getState(thread.id);
+          if (!latest) throw new ApiError(422, "Cannot regenerate a thread without state");
+          const graph = runtime.getGraph?.(assistant.graphId);
+          if (graph && typeof graph === "object" && "getState" in graph && typeof graph.getState === "function") {
+            const native = await (graph.getState as (config: JsonRecord) => Promise<JsonRecord>)({ configurable: { thread_id: thread.id } });
+            const values = object(native.values);
+            const messages = Array.isArray(values.messages) ? values.messages : [];
+            const last = messages.at(-1) as { getType?: () => string; type?: string } | undefined;
+            if (last?.getType?.() === "ai" || last?.type === "ai") {
+              await runtime.updateState(thread.id, { messages: new Overwrite(messages.slice(0, -1)) });
+            }
+          }
+        }
         const run = resumed
           ? await runtime.resumeRun({ threadId: thread.id, resume: command.resume ?? object(payload.input).respond, graphId: assistant.graphId })
           : await runtime.startRun({ threadId: thread.id, graphId: assistant.graphId, assistantId,
-            input: payload.input, config: object(payload.config), metadata: object(payload.metadata) });
+            input: payload.input ?? {}, config: runConfig, metadata: object(payload.metadata) });
         return apiRun(run);
       },
       async get(threadId, runId) { const row = await getRun(runId, threadId); return row ? apiRun(row) : null; },
@@ -238,8 +287,10 @@ export function createPlatformAdapter(runtime: RuntimeHandle, store: Store, grap
         return true;
       },
     },
-    async health() { return { status: "healthy", database: store.dialect, queue: "ready" }; },
+    async health() { return { status: "healthy", database: store.dialect,
+      queue: process.env.EXECUTION_MODE === "distributed" ? "bullmq" : "inline" }; },
     async info() { return { name: "Valida", version: "0.1.0", status: "running",
-      flags: { assistants: true, threads: true, runs: true, v2_event_streaming: false } }; },
+      flags: { assistants: true, threads: true, runs: true, store: Boolean(extensions.store),
+        crons: Boolean(extensions.crons), v2_event_streaming: true } }; },
   };
 }

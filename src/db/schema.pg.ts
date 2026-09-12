@@ -45,3 +45,19 @@ export const lgWrites = pgTable("lg_writes", {
   writeIdx: integer("write_idx").notNull(), channel: text("channel").notNull(),
   valueType: text("value_type").notNull(), valueBlob: text("value_blob").notNull(),
 }, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.writeIdx] })]);
+
+export const storeItems = pgTable("valida_store_items", {
+  namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),
+  itemValue: text("item_value").notNull(), createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(), expiresAt: text("expires_at"),
+}, table => [primaryKey({ columns: [table.namespace, table.itemKey] })]);
+
+export const crons = pgTable("valida_crons", {
+  id: text("cron_id").primaryKey(), assistantId: text("assistant_id").notNull(),
+  threadId: text("thread_id"), schedule: text("schedule").notNull(),
+  timezone: text("timezone").notNull(), enabled: integer("enabled").notNull(),
+  payload: text("payload").notNull(), metadata: text("metadata").notNull(),
+  ownerId: text("owner_id"), nextRunAt: text("next_run_at"), endTime: text("end_time"),
+  leaseUntil: text("lease_until"), createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});

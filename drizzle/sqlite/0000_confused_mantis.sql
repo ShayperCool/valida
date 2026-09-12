@@ -1,4 +1,4 @@
-CREATE TABLE `assistants` (
+CREATE TABLE IF NOT EXISTS `assistants` (
 	`id` text PRIMARY KEY NOT NULL,
 	`graph_id` text NOT NULL,
 	`name` text NOT NULL,
@@ -9,7 +9,7 @@ CREATE TABLE `assistants` (
 	`updated_at` text NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE `checkpoints` (
+CREATE TABLE IF NOT EXISTS `checkpoints` (
 	`id` text PRIMARY KEY NOT NULL,
 	`thread_id` text NOT NULL,
 	`run_id` text NOT NULL,
@@ -23,7 +23,7 @@ CREATE TABLE `checkpoints` (
 	`created_at` text NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE `events` (
+CREATE TABLE IF NOT EXISTS `events` (
 	`run_id` text NOT NULL,
 	`seq` integer NOT NULL,
 	`event` text NOT NULL,
@@ -32,7 +32,7 @@ CREATE TABLE `events` (
 	PRIMARY KEY(`run_id`, `seq`)
 );
 --> statement-breakpoint
-CREATE TABLE `lg_checkpoints` (
+CREATE TABLE IF NOT EXISTS `lg_checkpoints` (
 	`thread_id` text NOT NULL,
 	`checkpoint_ns` text NOT NULL,
 	`checkpoint_id` text NOT NULL,
@@ -45,7 +45,7 @@ CREATE TABLE `lg_checkpoints` (
 	PRIMARY KEY(`thread_id`, `checkpoint_ns`, `checkpoint_id`)
 );
 --> statement-breakpoint
-CREATE TABLE `lg_writes` (
+CREATE TABLE IF NOT EXISTS `lg_writes` (
 	`thread_id` text NOT NULL,
 	`checkpoint_ns` text NOT NULL,
 	`checkpoint_id` text NOT NULL,
@@ -57,7 +57,7 @@ CREATE TABLE `lg_writes` (
 	PRIMARY KEY(`thread_id`, `checkpoint_ns`, `checkpoint_id`, `task_id`, `write_idx`)
 );
 --> statement-breakpoint
-CREATE TABLE `runs` (
+CREATE TABLE IF NOT EXISTS `runs` (
 	`id` text PRIMARY KEY NOT NULL,
 	`thread_id` text NOT NULL,
 	`assistant_id` text,
@@ -74,7 +74,7 @@ CREATE TABLE `runs` (
 	`updated_at` text NOT NULL
 );
 --> statement-breakpoint
-CREATE TABLE `threads` (
+CREATE TABLE IF NOT EXISTS `threads` (
 	`id` text PRIMARY KEY NOT NULL,
 	`metadata` text NOT NULL,
 	`status` text NOT NULL,
