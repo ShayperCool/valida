@@ -3,6 +3,7 @@ import { Client } from "@langchain/langgraph-sdk";
 import { createApi } from "./index";
 import { createRuntime } from "../engine/index";
 import { createPlatformAdapter, seedDefaultAssistants } from "../platform";
+import { Annotation, END, interrupt, START, StateGraph } from "@langchain/langgraph";
 
 test("LangGraph SDK runs a checkpointed HITL graph through the real API adapter", async () => {
   const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
@@ -60,6 +61,61 @@ test("LangGraph SDK runs a checkpointed HITL graph through the real API adapter"
     } finally {
       await stream.close();
     }
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("SDK resume command applies a state update at the HITL checkpoint", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    const state = Annotation.Root({ proposal: Annotation<string>, result: Annotation<string> });
+    const graph = new StateGraph(state)
+      .addNode("review", () => { interrupt("Approve?"); return {}; })
+      .addNode("finish", values => ({ result: values.proposal }))
+      .addEdge(START, "review").addEdge("review", "finish").addEdge("finish", END).compile();
+    runtime.registerGraph({ id: "review", graph });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()));
+    const client = new Client({ apiUrl: "http://valida.test", apiKey: null,
+      callerOptions: { maxRetries: 0,
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)) } });
+    const thread = await client.threads.create();
+    await client.runs.wait(thread.thread_id, "review", { input: { proposal: "original" } });
+    const result = await client.runs.wait(thread.thread_id, "review", {
+      command: { resume: true, update: { proposal: "edited" } },
+    });
+    expect(result).toMatchObject({ proposal: "edited", result: "edited" });
+    const redirected = await client.threads.create();
+    await client.runs.wait(redirected.thread_id, "review", { input: { proposal: "old" } });
+    const redirectedResult = await client.runs.wait(redirected.thread_id, "review", {
+      command: { resume: true, update: { proposal: "directed" }, goto: "finish" },
+    });
+    expect(redirectedResult).toMatchObject({ proposal: "directed", result: "directed" });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("custom graph resumes with an update and directed node", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    runtime.registerGraph({ id: "review", entrypoint: "review",
+      nodes: {
+        review: (_values, context) => ({ accepted: context.interrupt("Approve?") }),
+        finish: values => ({ result: values.proposal }),
+      }, edges: { review: "finish", finish: "__end__" } });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()));
+    const client = new Client({ apiUrl: "http://valida.test", apiKey: null,
+      callerOptions: { maxRetries: 0,
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)) } });
+    const thread = await client.threads.create();
+    await client.runs.wait(thread.thread_id, "review", { input: { proposal: "old" } });
+    const result = await client.runs.wait(thread.thread_id, "review", {
+      command: { resume: true, update: { proposal: "new" }, goto: "finish" },
+    });
+    expect(result).toMatchObject({ proposal: "new", result: "new" });
   } finally {
     await runtime.close();
   }

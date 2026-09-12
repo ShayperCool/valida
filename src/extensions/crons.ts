@@ -6,6 +6,7 @@ import type { ApiRequestContext, JsonRecord, PlatformAdapter } from "../api/type
 import { ApiError } from "../api/types.ts";
 import { currentUser } from "../auth.ts";
 import { createRelation } from "./ddl.ts";
+import { matchesAuthorizationFilter } from "../authz.ts";
 
 type CronBackend = NonNullable<PlatformAdapter["crons"]>;
 type Row = Record<string, unknown>;
@@ -28,7 +29,8 @@ const owner = (context?: ApiRequestContext): string | null => {
   return currentUser.getStore()?.identity ??
     (typeof principal?.identity === "string" ? principal.identity : null);
 };
-const visible = (row: Row, context?: ApiRequestContext) => !owner(context) || row.owner_id === owner(context);
+const visible = (row: Row, context?: ApiRequestContext) =>
+  (!owner(context) || row.owner_id === owner(context)) && matchesAuthorizationFilter("crons", cron(row));
 const positive = (value: unknown, fallback: number, max: number) => {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed >= 0 ? Math.min(parsed, max) : fallback;
@@ -199,7 +201,7 @@ export async function createCronExtension(store: Store, runtime: GraphRuntime): 
       return filtered.slice(offset, offset + limit).map(cron);
     },
     async count(value: JsonRecord, context: ApiRequestContext): Promise<number> {
-      const rows = await store.rows<Row>(sql`SELECT assistant_id, thread_id, enabled, metadata, owner_id FROM valida_crons`);
+      const rows = await store.rows<Row>(sql`SELECT * FROM valida_crons`);
       const metadata = object(value.metadata);
       return rows.filter((row) =>
         visible(row, context) &&

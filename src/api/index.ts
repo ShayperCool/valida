@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { ApiRequestContext, JsonRecord, PlatformAdapter, StreamEvent } from "./types";
 import { ApiError } from "./types";
 import { LegacyV2Bridge } from "./v2";
+import { currentAuthorization } from "../auth.ts";
 
 type ApiEnv = { Variables: { principal: unknown } };
 
@@ -32,7 +33,8 @@ function record(value: unknown): JsonRecord {
 
 async function body(request: Request): Promise<JsonRecord> {
   try {
-    return record(await request.json());
+    const parsed = record(await request.json());
+    return currentAuthorization.getStore()?.payload ?? parsed;
   } catch (cause) {
     if (cause instanceof ApiError) throw cause;
     throw new ApiError(400, "Invalid JSON body");

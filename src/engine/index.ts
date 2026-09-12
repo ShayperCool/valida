@@ -38,6 +38,7 @@ export interface StartRunOptions {
 export interface ResumeRunOptions {
   threadId: string; resume: unknown; graphId?: string;
   assistantId?: string | null; config?: JsonObject; metadata?: JsonObject;
+  update?: JsonObject; goto?: string | string[];
 }
 export interface StreamOptions { after?: number; pollMs?: number; signal?: AbortSignal }
 export interface V2RecordedEvent { id: string; event: ProtocolEvent }
@@ -193,7 +194,8 @@ export class GraphRuntime {
     const run = await this.store.createRun({
       threadId: options.threadId, graphId, assistantId: options.assistantId,
       input: null, resume: options.resume, config: options.config,
-      metadata: { ...options.metadata, __resumeProvided: true },
+      metadata: { ...options.metadata, __resumeProvided: true,
+        __commandUpdate: options.update, __commandGoto: options.goto },
     });
     await this.store.appendEvent(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
     await this.dispatch(run.id);
@@ -278,6 +280,21 @@ export class GraphRuntime {
     let step = previous?.step ?? -1;
     let parentId = previous?.id ?? null;
     if (!resuming && !continuing) values = this.merge(values, stateOf(run.input), graph);
+    if (resuming && !continuing &&
+      (isObject(run.metadata.__commandUpdate) || run.metadata.__commandGoto !== undefined)) {
+      if (isObject(run.metadata.__commandUpdate)) {
+        values = this.merge(values, run.metadata.__commandUpdate, graph);
+      }
+      const goto = run.metadata.__commandGoto;
+      if (typeof goto === "string" || (Array.isArray(goto) && goto.every(item => typeof item === "string"))) {
+        next = Array.isArray(goto) ? [...goto, ...next.slice(1)] : [goto, ...next.slice(1)];
+      }
+      step++;
+      const updated = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id,
+        graphId: graph.id, step, values, next, tasks: [], interrupts: [], parentId });
+      parentId = updated.id;
+      await this.store.appendEvent(run.id, "values", values);
+    }
     if (!previous || (!resuming && !continuing)) {
       step++;
       const initial = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
@@ -342,16 +359,34 @@ export class GraphRuntime {
     const config = { ...run.config, configurable, streamMode: ["updates", "values"] };
     const native = recovering ? await this.checkpointer.getTuple({ configurable: { thread_id: run.threadId } }) : undefined;
     const resumeNative = native && native.checkpoint.ts >= run.createdAt;
-    const input = run.metadata.__resumeProvided === true ? new Command({ resume: run.resume }) : resumeNative ? null : run.input;
+    const input = run.metadata.__resumeProvided === true
+      ? new Command({ resume: run.resume, update: run.metadata.__commandUpdate as JsonObject | undefined,
+        goto: run.metadata.__commandGoto as string | string[] | undefined })
+      : resumeNative ? null : run.input;
+    let terminalV2: ProtocolEvent | null = null;
+    let lastV2Seq = -1;
+    let sawInterruptUpdate = false;
+    const requestedIds = new Set<string>();
     if (graph.streamEvents) {
       const native = await graph.streamEvents(input, { ...config, version: "v3" });
       for await (const event of native) {
         const wire = toWire(event) as ProtocolEvent;
+        lastV2Seq = Math.max(lastV2Seq, wire.seq);
+        if (wire.method === "input.requested") {
+          const id = isObject(wire.params.data) ? wire.params.data.interrupt_id : undefined;
+          if (typeof id === "string") requestedIds.add(id);
+        }
+        if (wire.method === "lifecycle" && wire.params.namespace.length === 0 &&
+          isObject(wire.params.data) && wire.params.data.event === "completed") {
+          terminalV2 = wire;
+          continue;
+        }
         await this.store.appendEvent(run.id, "v2", wire);
         const data = wire.params.data;
         if (wire.params.namespace.length === 0 && wire.method === "updates") {
           const update = isObject(data) && typeof data.node === "string"
             ? { [data.node]: data.values } : data;
+          if (isObject(update) && "__interrupt__" in update) sawInterruptUpdate = true;
           await this.store.appendEvent(run.id, "updates", update);
         } else if (wire.params.namespace.length === 0 && wire.method === "values") {
           await this.store.appendEvent(run.id, "values", data);
@@ -381,7 +416,25 @@ export class GraphRuntime {
       step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
       parentId: previous?.id ?? null });
     const status = interrupts.length || next.length ? "interrupted" : "success";
-    if (interrupts.length) await this.store.appendEvent(run.id, "updates", { __interrupt__: interrupts });
+    if (interrupts.length && !sawInterruptUpdate) await this.store.appendEvent(run.id, "updates", { __interrupt__: interrupts });
+    if (graph.streamEvents) {
+      if (status === "interrupted") {
+        let seq = terminalV2?.seq ?? lastV2Seq + 1;
+        for (const entry of interrupts) {
+          const id = isObject(entry) && typeof entry.id === "string" ? entry.id : `${run.id}:${seq}`;
+          if (requestedIds.has(id)) continue;
+          const request: ProtocolEvent = { type: "event", seq: seq++, method: "input.requested",
+            params: { namespace: [], timestamp: Date.now(), data: {
+              interrupt_id: id, payload: isObject(entry) ? entry.value : entry,
+            } } };
+          await this.store.appendEvent(run.id, "v2", request);
+        }
+        await this.store.appendEvent(run.id, "v2", { type: "event", seq, method: "lifecycle",
+          params: { namespace: [], timestamp: Date.now(), data: { event: "interrupted", graph_name: "root" } } });
+      } else if (terminalV2) {
+        await this.store.appendEvent(run.id, "v2", terminalV2);
+      }
+    }
     await this.store.updateRun(run.id, { status, output: values, leaseUntil: null });
     await this.store.updateThread(run.threadId, { status: status === "success" ? "idle" : "interrupted" });
     await this.store.appendEvent(run.id, "end", { status, output: values });

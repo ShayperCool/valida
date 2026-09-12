@@ -1,11 +1,13 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createApi } from "./api/index.ts";
+import { NativeV2Bridge } from "./api/native_v2.ts";
 import { authMiddleware, loadAuth } from "./auth.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { createPlatformAdapter } from "./platform.ts";
 import { createStoreExtension } from "./extensions/store.ts";
 import { createCronExtension } from "./extensions/crons.ts";
+import { createAssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 import { loadCustomApp, loadMiddleware } from "./plugins.ts";
 
 const { runtime, config, mode } = await bootstrap();
@@ -33,7 +35,9 @@ if (config.value.http?.middleware_order === "auth_first") {
 
 const kv = await createStoreExtension(runtime.store);
 const crons = await createCronExtension(runtime.store, runtime);
-const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), { store: kv, crons });
+const versions = await createAssistantVersionsExtension(runtime.store);
+const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), { store: kv, crons, versions });
+adapter.v2 = new NativeV2Bridge(adapter, runtime);
 app.route("/", createApi(adapter));
 const custom = await loadCustomApp(config);
 if (custom) app.route("/", custom);
