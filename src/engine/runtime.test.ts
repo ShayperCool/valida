@@ -1,5 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { Annotation, END, interrupt, START, StateGraph } from "@langchain/langgraph";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
+import { MessagesAnnotation } from "@langchain/langgraph";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -69,4 +71,30 @@ test("compiled StateGraph uses durable checkpointer for interrupt and resume", a
   const second = await resumedRuntime.resumeRun({ threadId: thread.id, resume: true });
   expect((await resumedRuntime.waitRun(second.id)).status).toBe("success");
   expect((await resumedRuntime.getState(thread.id))?.values).toMatchObject({ value: 2, approved: true });
+});
+
+test("compiled graph exposes Agent Protocol messages in events and saved state", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" } }); open.push(runtime);
+  const graph = new StateGraph(MessagesAnnotation)
+    .addNode("reply", () => ({ messages: [new AIMessage("Echo: hello")] }))
+    .addEdge(START, "reply").addEdge("reply", END).compile();
+  runtime.registerGraph({ id: "chat", graph });
+  const thread = await runtime.createThread();
+  const run = await runtime.startRun({ threadId: thread.id, graphId: "chat",
+    input: { messages: [new HumanMessage("hello")] } });
+  expect((await runtime.waitRun(run.id)).status).toBe("success");
+  const messages = (await runtime.getState(thread.id))?.values.messages as Array<Record<string, unknown>>;
+  expect(messages.map(message => message.type)).toEqual(["human", "ai"]);
+  expect(messages.map(message => message.content)).toEqual(["hello", "Echo: hello"]);
+  expect(messages.every(message => typeof message.id === "string")).toBe(true);
+  expect(messages.every(message => !('lc' in message))).toBe(true);
+  const events = await runtime.store.listEvents(run.id);
+  const valueEvent = events.find(event => event.event === "values" &&
+    Array.isArray((event.data as Record<string, unknown>)?.messages) &&
+    ((event.data as { messages: unknown[] }).messages).length === 2);
+  expect(valueEvent).toBeDefined();
+  expect((valueEvent!.data as { messages: Array<{ type: string }> }).messages[1]?.type).toBe("ai");
+  const update = events.find(event => event.event === "updates" &&
+    (event.data as Record<string, unknown>)?.reply);
+  expect((update?.data as { reply: { messages: Array<{ type: string }> } }).reply.messages[0]?.type).toBe("ai");
 });

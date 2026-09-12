@@ -3,6 +3,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store } from "../db/index.js";
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
+import { toWire } from "./wire.js";
 
 export type State = JsonObject;
 export interface NodeContext {
@@ -236,14 +237,14 @@ export class GraphRuntime {
     const input = run.metadata.__resumeProvided === true ? new Command({ resume: run.resume }) : run.input;
     for await (const chunk of await graph.stream(input, config)) {
       const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
-      await this.store.appendEvent(run.id, mode, data);
+      await this.store.appendEvent(run.id, mode, toWire(data));
       await this.store.renewRun(run.id);
       if ((await this.store.getRun(run.id))?.status === "cancelled") return;
     }
     const snapshot = await graph.getState(config);
-    const values = stateOf(snapshot.values);
+    const values = stateOf(toWire(snapshot.values));
     const next = Array.isArray(snapshot.next) ? snapshot.next.map(String) : [];
-    const tasks = Array.isArray(snapshot.tasks) ? snapshot.tasks : [];
+    const tasks = Array.isArray(snapshot.tasks) ? toWire(snapshot.tasks) as unknown[] : [];
     const interrupts = tasks.flatMap((task: unknown) => isObject(task) && Array.isArray(task.interrupts) ? task.interrupts : []);
     const previous = await this.store.getState(run.threadId);
     await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: run.graphId,
@@ -263,7 +264,7 @@ export class GraphRuntime {
       await registered.graph.updateState?.({ configurable: { thread_id: threadId } }, update, asNode);
       const snapshot = await registered.graph.getState({ configurable: { thread_id: threadId } });
       return this.store.createCheckpoint({ threadId, runId: previous.runId, graphId: previous.graphId,
-        step: previous.step + 1, values: stateOf(snapshot.values),
+        step: previous.step + 1, values: stateOf(toWire(snapshot.values)),
         next: Array.isArray(snapshot.next) ? snapshot.next.map(String) : [],
         tasks: Array.isArray(snapshot.tasks) ? snapshot.tasks : [], interrupts: [], parentId: previous.id });
     }
