@@ -39,8 +39,19 @@ const ApprovalState = Annotation.Root({
 export const approval = new StateGraph(ApprovalState)
   .addNode("ask", state => {
     const proposal = state.proposal || lastHumanText(state.messages);
-    const approved = interrupt({ kind: "approval", proposal });
-    return { proposal, approved: Boolean(approved) };
+    const decision = interrupt({
+      action_requests: [{
+        name: "approve_proposal",
+        args: { proposal },
+        description: `Approve proposal: ${proposal}`,
+      }],
+      review_configs: [{ action_name: "approve_proposal", allowed_decisions: ["approve", "reject"] }],
+    });
+    const approval = typeof decision === "boolean" ? decision
+      : decision && typeof decision === "object" && "decisions" in decision
+        ? Array.isArray(decision.decisions) && decision.decisions[0]?.type === "approve"
+        : false;
+    return { proposal, approved: approval };
   })
   .addNode("finish", state => {
     const result = state.approved ? `Approved: ${state.proposal}` : `Rejected: ${state.proposal}`;
