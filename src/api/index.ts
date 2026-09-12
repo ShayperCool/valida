@@ -173,12 +173,13 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   });
   app.post("/assistants/:assistantId/versions", async (c) => {
     if (!adapter.assistants.versions) return error(501, "Assistant versions are not implemented");
-    return json(await adapter.assistants.versions(c.req.param("assistantId"), await body(c.req.raw), ctx(c)));
+    const filters = c.req.raw.body === null ? {} : await body(c.req.raw);
+    return json(await adapter.assistants.versions(c.req.param("assistantId"), filters, ctx(c)));
   });
   app.post("/assistants/:assistantId/latest", async (c) => {
     if (!adapter.assistants.setLatest) return error(501, "Assistant versions are not implemented");
     const id = c.req.param("assistantId");
-    const version = Number((await body(c.req.raw)).version);
+    const version = Number(c.req.query("version") ?? (c.req.raw.body === null ? undefined : (await body(c.req.raw)).version));
     if (!Number.isInteger(version) || version < 1) throw new ApiError(422, "version must be a positive integer");
     const assistant = await adapter.assistants.setLatest(id, version, ctx(c));
     return assistant ? json(assistant) : notFound("Assistant", id);
