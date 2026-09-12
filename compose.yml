@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: aegra
+      POSTGRES_PASSWORD: aegra
+      POSTGRES_DB: aegra
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegra -d aegra"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      PORT: 2026
+      DATABASE_URL: postgres://aegra:aegra@postgres:5432/aegra
+      REDIS_URL: redis://redis:6379
+      EXECUTION_MODE: distributed
+      RUN_WORKER_IN_API: "true"
+    ports:
+      - "2026:2026"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: .
+    command: ["bun", "src/worker.ts"]
+    profiles: ["extra-workers"]
+    environment:
+      DATABASE_URL: postgres://aegra:aegra@postgres:5432/aegra
+      REDIS_URL: redis://redis:6379
+      EXECUTION_MODE: distributed
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  postgres_data:
+  redis_data:
