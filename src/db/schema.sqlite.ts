@@ -1,0 +1,47 @@
+import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+
+export const assistants = sqliteTable("assistants", {
+  id: text("id").primaryKey(), graphId: text("graph_id").notNull(),
+  name: text("name").notNull(), description: text("description"),
+  config: text("config").notNull(), metadata: text("metadata").notNull(),
+  createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+});
+export const threads = sqliteTable("threads", {
+  id: text("id").primaryKey(), metadata: text("metadata").notNull(),
+  status: text("status").notNull(), createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+export const runs = sqliteTable("runs", {
+  id: text("id").primaryKey(), threadId: text("thread_id").notNull(),
+  assistantId: text("assistant_id"), graphId: text("graph_id").notNull(),
+  status: text("status").notNull(), input: text("input"), output: text("output"),
+  error: text("error"), config: text("config").notNull(), metadata: text("metadata").notNull(),
+  resume: text("resume"), leaseUntil: text("lease_until"),
+  createdAt: text("created_at").notNull(), updatedAt: text("updated_at").notNull(),
+});
+export const checkpoints = sqliteTable("checkpoints", {
+  id: text("id").primaryKey(), threadId: text("thread_id").notNull(),
+  runId: text("run_id").notNull(), graphId: text("graph_id").notNull(),
+  step: integer("step").notNull(), values: text("state_values").notNull(),
+  next: text("next").notNull(), tasks: text("tasks").notNull(),
+  interrupts: text("interrupts").notNull(), parentId: text("parent_id"),
+  createdAt: text("created_at").notNull(),
+});
+export const events = sqliteTable("events", {
+  runId: text("run_id").notNull(), seq: integer("seq").notNull(),
+  event: text("event").notNull(), data: text("data").notNull(),
+  createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.runId, table.seq] })]);
+export const lgCheckpoints = sqliteTable("lg_checkpoints", {
+  threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
+  checkpointId: text("checkpoint_id").notNull(), parentId: text("parent_id"),
+  checkpointType: text("checkpoint_type").notNull(), checkpointBlob: text("checkpoint_blob").notNull(),
+  metadataType: text("metadata_type").notNull(), metadataBlob: text("metadata_blob").notNull(),
+  createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId] })]);
+export const lgWrites = sqliteTable("lg_writes", {
+  threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
+  checkpointId: text("checkpoint_id").notNull(), taskId: text("task_id").notNull(),
+  writeIdx: integer("write_idx").notNull(), channel: text("channel").notNull(),
+  valueType: text("value_type").notNull(), valueBlob: text("value_blob").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.writeIdx] })]);
