@@ -165,7 +165,7 @@ test("native checkpoint history supports editing the first human turn", async ()
   expect(((await runtime.getGraphState(thread.id))?.values.messages as Array<{ content: string }>).map(message => message.content))
     .toEqual(["new first turn", "Echo: new first turn"]);
 
-  const refresh = await runtime.startRun({ threadId: thread.id, graphId: "editable", input: null,
+  const refresh = await runtime.startRun({ threadId: thread.id, graphId: "editable", input: {},
     config: { configurable: { checkpoint_id: beforeReply!.config!.checkpoint_id } } });
   expect((await runtime.waitRun(refresh.id)).status).toBe("success");
   expect(((await runtime.getGraphState(thread.id))?.values.messages as Array<{ content: string }>).map(message => message.content))
