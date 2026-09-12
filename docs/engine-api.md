@@ -51,8 +51,12 @@ runtime.startWorker(); // call only in worker processes
 
 When `queue` is set, `startRun` and `resumeRun` enqueue durable BullMQ jobs. API processes can omit `startWorker`. Set `inline: true` only when the current instance should also process runs. The queue job ID is the run ID, and database run claiming prevents duplicate workers from executing the same pending run.
 
+In standalone mode, the runtime scans for pending runs and expired leases every five seconds after graphs register. It continues a custom graph from its last completed checkpoint. BullMQ replacement workers wait for the prior database lease to expire before taking a stalled run.
+
 `runtime.store` exposes assistant, thread, run, checkpoint, and event repository methods. `runtime.stream(runId, { after })` replays stored events and follows a live run. Event names include `metadata`, `run`, `updates`, `values`, `error`, and `end`. `runtime.getHistory(threadId)` returns persisted snapshots. `runtime.updateState(threadId, values, asNode?)` updates both the API snapshot and the native LangGraph checkpoint for compiled graphs.
 
 Compiled graph events, API snapshots, and run output convert LangChain message instances to Agent Protocol objects such as `{ type: "ai", content: "Hello", id: "..." }`. The native LangGraph checkpoint retains its typed message objects for subsequent graph execution.
 
 Drizzle schemas live in `src/db/schema.sqlite.ts` and `src/db/schema.pg.ts`. Startup `Store.migrate()` creates the baseline tables for both dialects. Generate versioned SQL migrations with `bunx drizzle-kit generate --config drizzle.sqlite.config.ts` and `bunx drizzle-kit generate --config drizzle.pg.config.ts` after schema changes. The runtime needs `drizzle-orm`, `postgres`, `bullmq`, `ioredis`, `@langchain/core`, `@langchain/langgraph`, and `@langchain/langgraph-checkpoint` as direct dependencies.
+
+PostgreSQL startup migration runs inside a transaction with a database advisory lock, so API and worker replicas can initialize an empty database at the same time.

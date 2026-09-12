@@ -99,3 +99,24 @@ test("compiled graph exposes Agent Protocol messages in events and saved state",
     (event.data as Record<string, unknown>)?.reply);
   expect((update?.data as { reply: { messages: Array<{ type: string }> } }).reply.messages[0]?.type).toBe("ai");
 });
+
+test("standalone runtime resumes an expired run from its last checkpoint", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "valida-recovery-")); dirs.push(dir);
+  const url = join(dir, "db.sqlite");
+  const firstRuntime = await createRuntime({ db: { dialect: "sqlite", url } }); open.push(firstRuntime);
+  const thread = await firstRuntime.createThread();
+  const run = await firstRuntime.store.createRun({ threadId: thread.id, graphId: "recover", input: { count: 0 } });
+  await firstRuntime.store.createCheckpoint({ threadId: thread.id, runId: run.id, graphId: "recover",
+    step: 1, values: { count: 2 }, next: ["finish"], tasks: [], interrupts: [], parentId: null });
+  await firstRuntime.store.updateRun(run.id, { status: "running", leaseUntil: "2000-01-01T00:00:00.000Z" });
+  await firstRuntime.close(); open.splice(open.indexOf(firstRuntime), 1);
+
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url } }); open.push(runtime);
+  runtime.registerGraph({ id: "recover", entrypoint: "calculate", nodes: {
+    calculate: () => { throw new Error("should not replay completed node"); },
+    finish: state => ({ count: Number(state.count) + 1 }),
+  } });
+  await runtime.recoverPendingRuns();
+  expect((await runtime.waitRun(run.id)).status).toBe("success");
+  expect((await runtime.getState(thread.id))?.values.count).toBe(3);
+});
