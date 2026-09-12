@@ -120,3 +120,54 @@ test("standalone runtime resumes an expired run from its last checkpoint", async
   expect((await runtime.waitRun(run.id)).status).toBe("success");
   expect((await runtime.getState(thread.id))?.values.count).toBe(3);
 });
+
+test("native checkpoint history supports editing the first human turn", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" } }); open.push(runtime);
+  const graph = new StateGraph(MessagesAnnotation)
+    .addNode("reply", state => {
+      const last = [...state.messages].reverse().find(message => message.getType() === "human");
+      return { messages: [new AIMessage(`Echo: ${last?.content}`)] };
+    })
+    .addEdge(START, "reply").addEdge("reply", END).compile();
+  runtime.registerGraph({ id: "editable", graph });
+  const thread = await runtime.createThread();
+  const first = await runtime.startRun({ threadId: thread.id, graphId: "editable",
+    input: { messages: [new HumanMessage("first")] } });
+  expect((await runtime.waitRun(first.id)).status).toBe("success");
+  const history = await runtime.getGraphHistory(thread.id);
+  expect(history.length).toBeGreaterThan(1);
+  const beforeReply = history.find(snapshot => {
+    const messages = snapshot.values.messages as unknown[] | undefined;
+    return messages?.length === 1 && snapshot.next.includes("reply");
+  });
+  expect(beforeReply?.config?.checkpoint_id).toBeDefined();
+  const historical = await runtime.getGraphState(thread.id, beforeReply!.config!.checkpoint_id);
+  expect((historical?.values.messages as Array<{ content: string }>)[0]?.content).toBe("first");
+  const originalId = (historical!.values.messages as Array<{ id: string }>)[0]!.id;
+  const branch = await runtime.startRun({ threadId: thread.id, graphId: "editable",
+    input: { messages: [new HumanMessage({ id: originalId, content: "edited" })] },
+    config: { configurable: { checkpoint_id: beforeReply!.config!.checkpoint_id } } });
+  expect((await runtime.waitRun(branch.id)).status).toBe("success");
+  const latest = await runtime.getGraphState(thread.id);
+  expect((latest?.values.messages as Array<{ content: string }>).map(message => message.content))
+    .toEqual(["edited", "Echo: edited"]);
+  expect(latest?.parentConfig?.checkpoint_id).toBeDefined();
+  expect((await runtime.getGraphHistory(thread.id)).some(snapshot =>
+    snapshot.parentConfig?.checkpoint_id === beforeReply!.config!.checkpoint_id &&
+    snapshot.metadata.source === "input")).toBe(true);
+
+  const beforeHumanId = beforeReply!.parentConfig!.checkpoint_id!;
+  expect((await runtime.getGraphState(thread.id, beforeHumanId))?.values.messages).toEqual([]);
+  const edit = await runtime.startRun({ threadId: thread.id, graphId: "editable",
+    input: { messages: [new HumanMessage("new first turn")] },
+    config: { configurable: { checkpoint_id: beforeHumanId } } });
+  expect((await runtime.waitRun(edit.id)).status).toBe("success");
+  expect(((await runtime.getGraphState(thread.id))?.values.messages as Array<{ content: string }>).map(message => message.content))
+    .toEqual(["new first turn", "Echo: new first turn"]);
+
+  const refresh = await runtime.startRun({ threadId: thread.id, graphId: "editable", input: null,
+    config: { configurable: { checkpoint_id: beforeReply!.config!.checkpoint_id } } });
+  expect((await runtime.waitRun(refresh.id)).status).toBe("success");
+  expect(((await runtime.getGraphState(thread.id))?.values.messages as Array<{ content: string }>).map(message => message.content))
+    .toEqual(["first", "Echo: first"]);
+});

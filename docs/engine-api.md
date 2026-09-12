@@ -57,6 +57,8 @@ In standalone mode, the runtime scans for pending runs and expired leases every 
 
 Compiled graph events, API snapshots, and run output convert LangChain message instances to Agent Protocol objects such as `{ type: "ai", content: "Hello", id: "..." }`. The native LangGraph checkpoint retains its typed message objects for subsequent graph execution.
 
+`runtime.getGraphState(threadId, checkpointId?, graphId?)` and `runtime.getGraphHistory(threadId, limit?, graphId?)` expose native compiled StateGraph snapshots. Each result includes normalized `values`, `next`, `tasks`, `interrupts`, `metadata`, `config.checkpoint_id`, and `parentConfig.checkpoint_id`. History includes the initial checkpoint before a node runs. Pass a historical ID in `startRun({ config: { configurable: { checkpoint_id } }, ... })` to branch from that checkpoint; the runtime reads the new head after execution rather than mistaking the selected historical checkpoint for an interrupt.
+
 Drizzle schemas live in `src/db/schema.sqlite.ts` and `src/db/schema.pg.ts`. Startup `Store.migrate()` creates the baseline tables for both dialects. Generate versioned SQL migrations with `bunx drizzle-kit generate --config drizzle.sqlite.config.ts` and `bunx drizzle-kit generate --config drizzle.pg.config.ts` after schema changes. The runtime needs `drizzle-orm`, `postgres`, `bullmq`, `ioredis`, `@langchain/core`, `@langchain/langgraph`, and `@langchain/langgraph-checkpoint` as direct dependencies.
 
 PostgreSQL startup migration runs inside a transaction with a database advisory lock, so API and worker replicas can initialize an empty database at the same time.

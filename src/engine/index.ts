@@ -4,6 +4,7 @@ import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObjec
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
 import { toWire } from "./wire.js";
+export { toWire } from "./wire.js";
 
 export type State = JsonObject;
 export interface NodeContext {
@@ -24,6 +25,7 @@ export interface CompiledGraphLike {
   checkpointer?: BaseCheckpointSaver | boolean;
   stream(input: unknown, config: JsonObject): AsyncIterable<unknown> | Promise<AsyncIterable<unknown>>;
   getState(config: JsonObject): Promise<any>;
+  getStateHistory?(config: JsonObject, options?: { limit?: number }): AsyncIterable<any>;
   updateState?(config: JsonObject, values: unknown, asNode?: string): Promise<unknown>;
 }
 export interface CompiledGraphDefinition { id: string; graph: CompiledGraphLike | ((checkpointer: BaseCheckpointSaver) => CompiledGraphLike) }
@@ -37,6 +39,12 @@ export interface ResumeRunOptions {
   assistantId?: string | null; config?: JsonObject; metadata?: JsonObject;
 }
 export interface StreamOptions { after?: number; pollMs?: number; signal?: AbortSignal }
+export interface GraphCheckpointConfig extends JsonObject { thread_id: string; checkpoint_id?: string; checkpoint_ns?: string }
+export interface GraphStateSnapshot {
+  values: State; next: string[]; tasks: unknown[]; interrupts: unknown[];
+  metadata: JsonObject; config: GraphCheckpointConfig | null;
+  parentConfig: GraphCheckpointConfig | null; createdAt: string | null;
+}
 
 class GraphInterrupted extends Error {
   constructor(readonly value: unknown) { super("Graph interrupted"); }
@@ -92,12 +100,72 @@ export class GraphRuntime {
   getRun(runId: string) { return this.store.getRun(runId); }
   getRuns(threadId: string, limit?: number) { return this.store.listRuns(threadId, limit); }
 
+  private snapshot(raw: Record<string, any>): GraphStateSnapshot {
+    const config = raw.config?.configurable;
+    const parent = raw.parentConfig?.configurable;
+    const tasks = Array.isArray(raw.tasks) ? toWire(raw.tasks) as unknown[] : [];
+    return {
+      values: stateOf(toWire(raw.values)),
+      next: Array.isArray(raw.next) ? raw.next.map(String) : [],
+      tasks,
+      interrupts: tasks.flatMap(task => isObject(task) && Array.isArray(task.interrupts) ? task.interrupts : []),
+      metadata: stateOf(toWire(raw.metadata)),
+      config: config?.thread_id ? { thread_id: String(config.thread_id),
+        checkpoint_id: config.checkpoint_id ? String(config.checkpoint_id) : undefined,
+        checkpoint_ns: String(config.checkpoint_ns ?? "") } : null,
+      parentConfig: parent?.thread_id ? { thread_id: String(parent.thread_id),
+        checkpoint_id: parent.checkpoint_id ? String(parent.checkpoint_id) : undefined,
+        checkpoint_ns: String(parent.checkpoint_ns ?? "") } : null,
+      createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
+    };
+  }
+
+  /** Native LangGraph state with the checkpoint IDs needed for Edit/Refresh branching. */
+  async getGraphState(threadId: string, checkpointId?: string, graphId?: string): Promise<GraphStateSnapshot | null> {
+    const latest = await this.store.getState(threadId);
+    const registered = this.graphs.get(graphId ?? latest?.graphId ?? "");
+    if (registered?.kind === "compiled") {
+      const raw = await registered.graph.getState({ configurable: { thread_id: threadId,
+        ...(checkpointId ? { checkpoint_id: checkpointId } : {}) } });
+      return raw?.config?.configurable?.checkpoint_id ? this.snapshot(raw) : null;
+    }
+    const record = checkpointId ? await this.store.getCheckpoint(checkpointId) : latest;
+    if (!record || record.threadId !== threadId) return null;
+    return { values: record.values, next: record.next, tasks: record.tasks, interrupts: record.interrupts,
+      metadata: { step: record.step, source: "loop" },
+      config: { thread_id: threadId, checkpoint_id: record.id, checkpoint_ns: "" },
+      parentConfig: record.parentId ? { thread_id: threadId, checkpoint_id: record.parentId, checkpoint_ns: "" } : null,
+      createdAt: record.createdAt };
+  }
+
+  /** Return every native graph step for compiled graphs, including the initial checkpoint. */
+  async getGraphHistory(threadId: string, limit = 100, graphId?: string): Promise<GraphStateSnapshot[]> {
+    const latest = await this.store.getState(threadId);
+    const registered = this.graphs.get(graphId ?? latest?.graphId ?? "");
+    if (registered?.kind === "compiled" && registered.graph.getStateHistory) {
+      const history: GraphStateSnapshot[] = [];
+      for await (const raw of registered.graph.getStateHistory({ configurable: { thread_id: threadId } }, { limit })) {
+        history.push(this.snapshot(raw));
+      }
+      return history;
+    }
+    return (await this.store.getHistory(threadId, limit)).map(record => ({
+      values: record.values, next: record.next, tasks: record.tasks, interrupts: record.interrupts,
+      metadata: { step: record.step, source: "loop" },
+      config: { thread_id: threadId, checkpoint_id: record.id, checkpoint_ns: "" },
+      parentConfig: record.parentId ? { thread_id: threadId, checkpoint_id: record.parentId, checkpoint_ns: "" } : null,
+      createdAt: record.createdAt,
+    }));
+  }
+
   async startRun(options: StartRunOptions): Promise<RunRecord> {
     if (!this.graphs.has(options.graphId)) throw new Error(`Unknown graph: ${options.graphId}`);
     if (!await this.store.getThread(options.threadId)) await this.store.createThread({ id: options.threadId });
     const previous = await this.store.getState(options.threadId);
-    if (previous?.interrupts.length) throw new Error(`Thread ${options.threadId} is interrupted; call resumeRun`);
-    if (!await this.store.claimThread(options.threadId, ["idle", "error"])) throw new Error(`Thread ${options.threadId} is busy`);
+    const branchId = isObject(options.config?.configurable) ? options.config.configurable.checkpoint_id : undefined;
+    if (previous?.interrupts.length && !branchId) throw new Error(`Thread ${options.threadId} is interrupted; call resumeRun`);
+    const allowed = branchId ? ["idle", "error", "interrupted"] as const : ["idle", "error"] as const;
+    if (!await this.store.claimThread(options.threadId, [...allowed])) throw new Error(`Thread ${options.threadId} is busy`);
     try {
       const run = await this.store.createRun(options);
       await this.store.appendEvent(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
@@ -275,7 +343,9 @@ export class GraphRuntime {
       await this.store.renewRun(run.id);
       if ((await this.store.getRun(run.id))?.status === "cancelled") return;
     }
-    const snapshot = await graph.getState(config);
+    const latestConfigurable: JsonObject = { ...configurable };
+    delete latestConfigurable.checkpoint_id;
+    const snapshot = await graph.getState({ ...config, configurable: latestConfigurable });
     const values = stateOf(toWire(snapshot.values));
     const next = Array.isArray(snapshot.next) ? snapshot.next.map(String) : [];
     const tasks = Array.isArray(snapshot.tasks) ? toWire(snapshot.tasks) as unknown[] : [];
