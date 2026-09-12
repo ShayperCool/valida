@@ -88,6 +88,7 @@ test("compiled graph exposes Agent Protocol messages in events and saved state",
   expect(messages.map(message => message.content)).toEqual(["hello", "Echo: hello"]);
   expect(messages.every(message => typeof message.id === "string")).toBe(true);
   expect(messages.every(message => !('lc' in message))).toBe(true);
+  expect(messages.every(message => Object.keys(message).every(key => !key.startsWith("lc_")))).toBe(true);
   const events = await runtime.store.listEvents(run.id);
   const valueEvent = events.find(event => event.event === "values" &&
     Array.isArray((event.data as Record<string, unknown>)?.messages) &&

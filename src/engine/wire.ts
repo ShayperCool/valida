@@ -14,7 +14,9 @@ export function toWire(value: unknown): unknown {
   if (isBaseMessage(value)) {
     return {
       type: value.getType(),
-      ...Object.fromEntries(Object.entries(value).map(([key, item]) => [key, toWire(item)])),
+      ...Object.fromEntries(Object.entries(value)
+        .filter(([key]) => !key.startsWith("lc_"))
+        .map(([key, item]) => [key, toWire(item)])),
     };
   }
   if (Array.isArray(value)) return value.map(toWire);
@@ -23,7 +25,8 @@ export function toWire(value: unknown): unknown {
     const name = Array.isArray(record.id) ? record.id.at(-1) : undefined;
     if (record.lc === 1 && record.type === "constructor" && typeof name === "string" && constructorTypes[name]) {
       const kwargs = toWire(record.kwargs) as Record<string, unknown>;
-      return { type: constructorTypes[name], ...kwargs };
+      return { type: constructorTypes[name],
+        ...Object.fromEntries(Object.entries(kwargs).filter(([key]) => !key.startsWith("lc_"))) };
     }
     return Object.fromEntries(Object.entries(record).map(([key, item]) => [key, toWire(item)]));
   }
