@@ -104,3 +104,9 @@ An auth provider exports `authenticate(request)` and an optional `authorize({ us
 Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, namespaced JSON and optional semantic search, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, RemoteGraph, and AG-UI `HttpAgent` are covered by deterministic integration tests. OpenTelemetry tracing can fan out to OTLP, Langfuse, and Phoenix. The store returns 501 for semantic queries until an embedding index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
 
 Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime. With a server running, `bun run smoke` exercises the deployed API through the SDK and RemoteGraph. Set `VALIDA_API_URL` and `VALIDA_API_URL_2` to different API instances to verify cross-instance state and execution. Tests use SQLite and deterministic graphs; the distributed path has also been exercised with PostgreSQL, Redis, separate API and worker processes.
+
+## Releases
+
+The manual GitHub Actions release workflow tests Bun 1.4.1, builds a versioned source archive with `bun.lock`, verifies its SHA-256 checksum, and runs the SDK smoke test from an unpacked archive. It then publishes a Linux amd64/arm64 container image to GHCR and creates a GitHub Release tagged from `package.json` (for example, `v0.1.0`). The same image runs the API by default or a separate worker with `bun src/worker.ts`.
+
+To verify a release archive locally, run `bash scripts/build-release.sh` and `bash scripts/release-smoke.sh`. Releases do not publish to npm; install the archive with Bun or use the container image.
