@@ -336,8 +336,16 @@ export function createPlatformAdapter(
         }
       },
       async cancel(threadId, runId) {
-        if (!await getRun(runId, threadId)) return false;
-        await store.cancelRun(runId);
+        const existing = await getRun(runId, threadId);
+        if (!existing) return false;
+        const cancelled = await store.cancelRun(runId);
+        if (cancelled) {
+          const state = await store.getState(cancelled.threadId);
+          await store.updateThread(cancelled.threadId, {
+            status: state?.interrupts.length ? "interrupted" : "idle",
+          });
+          await store.appendEvent(runId, "end", { status: "cancelled" });
+        }
         return true;
       },
     },
