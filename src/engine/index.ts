@@ -83,12 +83,19 @@ export class GraphRuntime {
   private readonly runTimeoutMs: number;
   private readonly runLeaseMs: number;
   private readonly recoveryPollMs: number;
+  private readonly maxConcurrentRuns: number;
+  private slotsInUse = 0;
+  private readonly slotWaiters: Array<() => void> = [];
   private readonly graphs = new Map<string, { kind: "custom"; graph: GraphDefinition } | { kind: "compiled"; graph: CompiledGraphLike }>();
 
   constructor(store: Store, config: Omit<RuntimeConfig,"db"> = {}) {
     this.store = store;
     this.telemetry = config.telemetry;
     this.checkpointer = new DrizzleCheckpointer(store);
+    this.maxConcurrentRuns = config.queue ? config.queue.concurrency ?? 4 : Infinity;
+    if (config.queue && (!Number.isInteger(this.maxConcurrentRuns) || this.maxConcurrentRuns < 1)) {
+      throw new Error("queue.concurrency must be a positive integer");
+    }
     this.queue = config.queue ? new RunQueue(config.queue) : undefined;
     this.inline = config.inline ?? !config.queue;
     this.runTimeoutMs = config.runTimeoutMs ?? 3_600_000;
@@ -264,20 +271,47 @@ export class GraphRuntime {
     }
   }
 
+  private async acquireExecutionSlot(): Promise<() => void> {
+    if (this.slotsInUse >= this.maxConcurrentRuns) {
+      await new Promise<void>(resolve => { this.slotWaiters.push(resolve); });
+    } else {
+      this.slotsInUse++;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = this.slotWaiters.shift();
+      if (next) next();
+      else this.slotsInUse--;
+    };
+  }
+
   async executeRun(runId: string): Promise<void> {
     if (this.active.has(runId)) return;
     this.active.add(runId);
+    let releaseSlot: (() => void) | undefined;
     try {
       let recovering = false;
       for (;;) {
         const before = await this.store.getRun(runId);
         if (!before || completed.has(before.status)) return;
-        recovering = before.status === "running";
+        const remaining = before.leaseUntil ? Date.parse(before.leaseUntil) - Date.now() : 0;
+        if (before.status === "running" && remaining > 0) {
+          await sleep(Math.min(Math.max(remaining + 20, 100), 5_000));
+          continue;
+        }
+        releaseSlot = await this.acquireExecutionSlot();
+        const current = await this.store.getRun(runId);
+        if (!current || completed.has(current.status)) return;
+        recovering = current.status === "running";
         if (await this.store.claimRun(runId, this.runLeaseMs)) break;
         // A stalled BullMQ job may be retried before its database lease expires.
         // Keep the replacement job alive until the owner finishes or the lease expires.
-        const remaining = before.leaseUntil ? Date.parse(before.leaseUntil) - Date.now() : 0;
-        await sleep(Math.min(Math.max(remaining + 20, 100), 5_000));
+        releaseSlot();
+        releaseSlot = undefined;
+        const retryAfter = current.leaseUntil ? Date.parse(current.leaseUntil) - Date.now() : 0;
+        await sleep(Math.min(Math.max(retryAfter + 20, 100), 5_000));
       }
       const run = await this.store.getRun(runId);
       if (!run) return;
@@ -344,6 +378,7 @@ export class GraphRuntime {
       if (control?.timeoutTimer) clearTimeout(control.timeoutTimer);
       await control?.heartbeat;
       this.controls.delete(runId);
+      releaseSlot?.();
       this.active.delete(runId);
     }
   }

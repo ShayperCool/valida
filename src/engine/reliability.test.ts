@@ -111,3 +111,42 @@ test("distributed worker processes durable pending run while Redis is unavailabl
   expect((await worker.waitRun(run.id)).status).toBe("success");
   expect((await api.getState(thread.id))?.values.count).toBe(1);
 });
+
+test("database recovery and a queue callback share the worker concurrency limit", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" },
+    queue: { redisUrl: "redis://127.0.0.1:29999", name: `valida-limit-${crypto.randomUUID()}`, concurrency: 1 },
+    inline: false, recoveryPollMs: 20 });
+  runtimes.push(runtime);
+  const firstStarted = deferred(), release = deferred();
+  let active = 0, peak = 0, started = 0;
+  runtime.registerGraph({ id: "blocked", entrypoint: "work", nodes: {
+    work: async () => {
+      started++;
+      active++;
+      peak = Math.max(peak, active);
+      firstStarted.resolve();
+      try { await release.promise; }
+      finally { active--; }
+      return { done: true };
+    },
+  } });
+  const pending = async () => {
+    const thread = await runtime.createThread();
+    await runtime.store.claimThread(thread.id, ["idle"]);
+    return runtime.store.createRun({ threadId: thread.id, graphId: "blocked" });
+  };
+  const runs = [await pending()];
+  runtime.startWorker();
+  await firstStarted.promise;
+  for (let index = 0; index < 4; index++) runs.push(await pending());
+  // BullMQ invokes the same public callback while the DB recovery poller is active.
+  const queuedCallback = runtime.executeRun(runs[1]!.id);
+  await sleep(100);
+  expect(started).toBe(1);
+  expect(peak).toBe(1);
+  release.resolve();
+  expect((await Promise.all(runs.map(run => runtime.waitRun(run.id)))).every(run => run.status === "success")).toBe(true);
+  await queuedCallback;
+  expect(started).toBe(5);
+  expect(peak).toBe(1);
+});
