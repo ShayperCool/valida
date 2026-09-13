@@ -1,4 +1,13 @@
-import { integer, pgTable, primaryKey, text } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
+import { customType, index, integer, pgTable, primaryKey, text } from "drizzle-orm/pg-core";
+
+// Configured models may have different dimensions, so the HNSW index uses a
+// per-dimension cast and predicate instead of a fixed column dimension.
+const vector = customType<{ data: number[]; driverData: string }>({
+  dataType: () => "vector",
+  toDriver: value => JSON.stringify(value),
+  fromDriver: value => JSON.parse(value) as number[],
+});
 
 export const assistants = pgTable("assistants", {
   id: text("id").primaryKey(), graphId: text("graph_id").notNull(),
@@ -56,6 +65,17 @@ export const storeEmbeddings = pgTable("valida_store_embeddings", {
   namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),
   sourceHash: text("source_hash").notNull(), vectors: text("vectors").notNull(),
 }, table => [primaryKey({ columns: [table.namespace, table.itemKey] })]);
+
+export const storeVectors = pgTable("valida_store_vectors", {
+  namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),
+  field: text("field").notNull(), sourceHash: text("source_hash").notNull(),
+  dims: integer("dims").notNull(), embedding: vector("embedding").notNull(),
+}, table => [
+  primaryKey({ columns: [table.namespace, table.itemKey, table.field] }),
+  index("valida_store_vectors_hnsw_1536")
+    .using("hnsw", sql`(embedding::vector(1536)) vector_cosine_ops`)
+    .where(sql`dims = 1536`),
+]);
 
 export const crons = pgTable("valida_crons", {
   id: text("cron_id").primaryKey(), assistantId: text("assistant_id").notNull(),
