@@ -72,6 +72,11 @@ export function routeAuthTarget(method: string, path: string): AuthTarget | null
   const queryAction = (part: string | undefined): string | null =>
     part === "search" || part === "count" ? "search" : null;
 
+  if (root === "ag-ui" && second && !third && method === "POST") {
+    params.assistant_id = second;
+    return target("threads", "create_run");
+  }
+
   if (root === "runs" && second === "crons") {
     if (fourth || fifth) return null;
     if (third && !queryAction(third)) params.cron_id = third;
