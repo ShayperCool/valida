@@ -7,6 +7,7 @@ import { ApiError } from "./api/types.ts";
 import { currentUser } from "./auth.ts";
 import { matchesAuthorizationFilter } from "./authz.ts";
 import type { AssistantVersionsExtension } from "./extensions/assistant_versions.ts";
+import { ThreadPruner } from "./extensions/thread_prune.ts";
 
 type RuntimeHandle = {
   startRun(input: {
@@ -88,8 +89,9 @@ export async function seedDefaultAssistants(store: Store, graphIds: string[]): P
 export function createPlatformAdapter(
   runtime: RuntimeHandle, store: Store, graphIds: string[],
   extensions: { store?: PlatformAdapter["store"]; crons?: PlatformAdapter["crons"];
-    versions?: AssistantVersionsExtension } = {},
+    versions?: AssistantVersionsExtension; pruner?: ThreadPruner } = {},
 ): PlatformAdapter {
+  const pruner = extensions.pruner ?? new ThreadPruner(store);
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
   async function threadWithValues(row: ThreadRecord): Promise<Thread> {
     return { ...apiThread(row), values: (await store.getState(row.id))?.values ?? {} };
@@ -261,6 +263,12 @@ export function createPlatformAdapter(
         const state = await store.getState(id);
         if (state) await store.createCheckpoint({ ...state, id: undefined, threadId: created.id, parentId: null });
         return threadWithValues(created);
+      },
+      async prune(payload) {
+        const strategy = payload.strategy ?? "delete";
+        if (strategy !== "delete") throw new ApiError(501, `Thread prune strategy '${strategy}' is not implemented`);
+        const count = await pruner.prune(payload.thread_ids as string[], visible);
+        return { pruned_count: count, deleted: count, pruned: 0 };
       },
     },
     runs: {
