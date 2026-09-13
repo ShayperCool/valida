@@ -38,10 +38,14 @@ paths in `index` overrides the configured fields for that item.
 Search computes cosine similarity over finite, nonzero vectors of the configured
 size. It returns each matching item with a `score` from -1 to 1, sorted by score
 before `offset` and `limit`. TTL, namespace prefix, metadata and authorization
-filters run before ranking. SQLite and PostgreSQL store the same vector JSON in
-`valida_store_embeddings`. The current implementation scans matching rows in
-application memory, so search time grows with the number of indexed items.
-Existing items written before index activation need a `put` to create vectors.
+filters run before ranking. SQLite stores vectors as JSON in
+`valida_store_embeddings` and ranks matching rows in application memory.
+PostgreSQL stores them in native `vector` columns and ranks with pgvector;
+dimension-specific HNSW indexes support up to 4000 dimensions (`halfvec`
+above 2000). PostgreSQL needs the `vector` extension, included in the Compose
+image. Existing JSON embeddings from an earlier PostgreSQL Valida version
+are imported into pgvector at startup. Items written before any index was
+enabled still need a `put` to create vectors.
 
 `createCronExtension(store, runtime)` creates the cron table and returns the
 methods used by `PlatformAdapter.crons`. Enabled crons fire once at creation,

@@ -77,7 +77,7 @@ function parseHeaders(raw?: string): Record<string, string> {
   }));
 }
 
-/** Resolves Aegra-compatible OTEL_TARGETS; each target receives the same spans. */
+/** Resolves OTEL_TARGETS; each target receives the same spans. */
 export function resolveTelemetryTargets(env: Environment = process.env): ExportTarget[] {
   if (env.OTEL_SDK_DISABLED?.toLowerCase() === "true" || env.OTEL_TRACES_EXPORTER?.toLowerCase() === "none") return [];
   const named = env.OTEL_TARGETS?.split(",").map(value => value.trim().toUpperCase()).filter(Boolean);
