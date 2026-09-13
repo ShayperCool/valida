@@ -81,6 +81,15 @@ function ensureVisible(record: ThreadRecord | null): ThreadRecord | null {
 function matchesMetadata(value: JsonRecord, filter: JsonRecord): boolean {
   return Object.entries(filter).every(([key, expected]) => value[key] === expected);
 }
+function matchesValues(value: unknown, filter: unknown): boolean {
+  if (filter && typeof filter === "object" && !Array.isArray(filter)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    return Object.entries(filter).every(([key, expected]) =>
+      matchesValues((value as JsonRecord)[key], expected));
+  }
+  return JSON.stringify(value) === JSON.stringify(filter);
+}
+const threadSortFields = new Set(["thread_id", "status", "created_at", "updated_at", "state_updated_at"]);
 
 export async function seedDefaultAssistants(store: Store, graphIds: string[]): Promise<void> {
   for (const id of graphIds) {
@@ -95,8 +104,10 @@ export function createPlatformAdapter(
 ): PlatformAdapter {
   const pruner = extensions.pruner ?? new ThreadPruner(store);
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
-  async function threadWithValues(row: ThreadRecord): Promise<Thread> {
-    return { ...apiThread(row), values: (await store.getState(row.id))?.values ?? {} };
+  async function threadWithValues(row: ThreadRecord, knownState?: CheckpointRecord | null): Promise<Thread> {
+    const state = knownState === undefined ? await store.getState(row.id) : knownState;
+    return { ...apiThread(row), values: state?.values ?? {},
+      state_updated_at: state?.createdAt ?? row.createdAt };
   }
   async function getRun(id: string, threadId: string | null) {
     const result = await runtime.getRun(id);
@@ -213,11 +224,51 @@ export function createPlatformAdapter(
         return threadWithValues(row);
       },
       async search(query) {
+        if (query.ids != null && (!Array.isArray(query.ids) ||
+          !query.ids.every(id => typeof id === "string"))) {
+          throw new ApiError(422, "ids must be an array of thread IDs");
+        }
+        if (query.values != null &&
+          (typeof query.values !== "object" || Array.isArray(query.values))) {
+          throw new ApiError(422, "values must be an object");
+        }
+        if (query.sort_by != null &&
+          (typeof query.sort_by !== "string" || !threadSortFields.has(query.sort_by))) {
+          throw new ApiError(422, "Unsupported thread sort_by");
+        }
+        if (query.sort_order != null && query.sort_order !== "asc" && query.sort_order !== "desc") {
+          throw new ApiError(422, "sort_order must be asc or desc");
+        }
+        const ids = query.ids == null ? null : new Set(query.ids as string[]);
+        const values = query.values == null ? null : object(query.values);
+        const sortBy = typeof query.sort_by === "string" ? query.sort_by : "created_at";
+        const direction = query.sort_order === "asc" ? 1 : -1;
         const rows = await store.listThreads(100_000);
         const filtered = rows.filter(row => visible(row) &&
+          (ids === null || ids.has(row.id)) &&
           (!query.status || row.status === query.status) &&
           matchesMetadata(row.metadata, object(query.metadata)));
-        return Promise.all(filtered.slice(number(query.offset, 0), number(query.offset, 0) + number(query.limit, 10)).map(threadWithValues));
+        const needsState = values !== null || sortBy === "state_updated_at";
+        let candidates = needsState
+          ? await Promise.all(filtered.map(async row => ({ row, state: await store.getState(row.id) })))
+          : filtered.map(row => ({ row, state: undefined as CheckpointRecord | null | undefined }));
+        if (values !== null) candidates = candidates.filter(({ state }) => matchesValues(state?.values ?? {}, values));
+        const sortValue = ({ row, state }: (typeof candidates)[number]): string => {
+          switch (sortBy) {
+            case "thread_id": return row.id;
+            case "status": return row.status;
+            case "created_at": return row.createdAt;
+            case "state_updated_at": return state?.createdAt ?? row.createdAt;
+            default: return row.updatedAt;
+          }
+        };
+        candidates.sort((left, right) => {
+          const primary = sortValue(left).localeCompare(sortValue(right));
+          return primary ? primary * direction : left.row.id.localeCompare(right.row.id);
+        });
+        const offset = number(query.offset, 0);
+        const limit = number(query.limit, 10);
+        return Promise.all(candidates.slice(offset, offset + limit).map(({ row, state }) => threadWithValues(row, state)));
       },
       async get(id) { const row = await getThread(id); return row ? threadWithValues(row) : null; },
       async update(id, payload) {
