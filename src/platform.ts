@@ -22,6 +22,7 @@ type RuntimeHandle = {
   getGraph?(id: string): unknown;
   getGraphState?(threadId: string, checkpointId?: string, graphId?: string): Promise<GraphStateSnapshot | null>;
   getGraphHistory?(threadId: string, limit?: number, graphId?: string): Promise<GraphStateSnapshot[]>;
+  captureTraceContext?(): { traceparent?: string; tracestate?: string } | undefined;
 };
 
 const object = (value: unknown): JsonRecord =>
@@ -42,7 +43,8 @@ const apiThread = (record: ThreadRecord): Thread => ({
 const apiRun = (record: RunRecord): Run => ({
   run_id: record.id, thread_id: record.threadId, assistant_id: record.assistantId ?? record.graphId,
   status: record.status === "cancelled" ? "error" : record.status,
-  metadata: record.metadata, created_at: record.createdAt, updated_at: record.updatedAt,
+  metadata: Object.fromEntries(Object.entries(record.metadata).filter(([key]) => !key.startsWith("__"))),
+  created_at: record.createdAt, updated_at: record.updatedAt,
 });
 const apiState = (record: CheckpointRecord | null, threadId: string): ThreadState => ({
   values: record?.values ?? {}, next: record?.next ?? [],
@@ -274,6 +276,9 @@ export function createPlatformAdapter(
           ...thread.metadata, graph_id: assistant.graphId, assistant_id: assistantId,
         } });
         const command = object(payload.command);
+        const metadata = { ...object(payload.metadata) };
+        const traceContext = runtime.captureTraceContext?.();
+        if (traceContext?.traceparent) metadata.__trace_context = traceContext;
         const resumed = payload.command != null || (payload.input && object(payload.input).respond !== undefined);
         const checkpoint = object(payload.checkpoint);
         const checkpointId = typeof checkpoint.checkpoint_id === "string" ? checkpoint.checkpoint_id
@@ -307,9 +312,9 @@ export function createPlatformAdapter(
               (Array.isArray(command.goto) && command.goto.every(item => typeof item === "string"))
               ? command.goto as string | string[] : undefined,
             graphId: assistant.graphId, assistantId, config: runConfig,
-            metadata: object(payload.metadata) })
+            metadata })
           : await runtime.startRun({ threadId: thread.id, graphId: assistant.graphId, assistantId,
-            input: payload.input ?? {}, config: runConfig, metadata: object(payload.metadata) });
+            input: payload.input ?? {}, config: runConfig, metadata });
         return apiRun(run);
       },
       async get(threadId, runId) { const row = await getRun(runId, threadId); return row ? apiRun(row) : null; },

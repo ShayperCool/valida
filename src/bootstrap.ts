@@ -4,6 +4,7 @@ import type { DatabaseConfig } from "./db/index.ts";
 import { createRuntime, type CompiledGraphLike, type GraphDefinition } from "./engine/index.ts";
 import { loadConfig, loadModuleRef } from "./config.ts";
 import { seedDefaultAssistants } from "./platform.ts";
+import { initializeTelemetryFromEnv } from "./telemetry.ts";
 
 export async function bootstrap(options: { workerOnly?: boolean } = {}) {
   const config = await loadConfig();
@@ -21,10 +22,12 @@ export async function bootstrap(options: { workerOnly?: boolean } = {}) {
   if (mode === "distributed" && (!redisUrl || db.dialect !== "postgres")) {
     throw new Error("Distributed mode requires PostgreSQL DATABASE_URL and REDIS_URL");
   }
+  const telemetry = initializeTelemetryFromEnv();
   const runtime = await createRuntime({
     db,
     queue: mode === "distributed" ? { redisUrl: redisUrl!, concurrency: config.value.execution?.concurrency } : undefined,
     inline: mode !== "distributed",
+    telemetry,
   });
   for (const [id, ref] of Object.entries(config.value.graphs)) {
     const graph = await loadModuleRef<CompiledGraphLike | Omit<GraphDefinition, "id"> | ((checkpointer: unknown) => CompiledGraphLike)>(ref, config.directory);
@@ -35,5 +38,5 @@ export async function bootstrap(options: { workerOnly?: boolean } = {}) {
     }
   }
   if (!options.workerOnly) await seedDefaultAssistants(runtime.store, runtime.listGraphs());
-  return { runtime, config, mode };
+  return { runtime, config, mode, telemetry };
 }

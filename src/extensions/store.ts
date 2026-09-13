@@ -223,7 +223,7 @@ export async function createStoreExtension(store: Store, options: StoreOptions =
       if (maxDepth === 0) throw new ApiError(422, "max_depth must be positive");
       const limit = integer(payload.limit, 100);
       const offset = integer(payload.offset, 0, Number.MAX_SAFE_INTEGER);
-      const rows = await store.rows<Row>(sql`SELECT namespace, expires_at FROM valida_store_items`);
+      const rows = await store.rows<Row>(sql`SELECT * FROM valida_store_items`);
       const stamp = now();
       const names = new Map<string, string[]>();
       for (const row of rows) {

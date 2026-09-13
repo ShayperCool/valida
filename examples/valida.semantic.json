@@ -1,0 +1,17 @@
+{
+  "graphs": {
+    "echo": "./graphs.ts:echo",
+    "counter": "./graphs.ts:counter",
+    "approval": "./graphs.ts:approval"
+  },
+  "store": {
+    "index": {
+      "dims": 3,
+      "embed": "./embeddings.ts:embedTexts",
+      "fields": ["text"]
+    }
+  },
+  "http": {
+    "cors": { "allow_origins": ["*"] }
+  }
+}

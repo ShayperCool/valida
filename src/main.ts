@@ -2,16 +2,19 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createApi } from "./api/index.ts";
 import { NativeV2Bridge } from "./api/native_v2.ts";
+import { V1StreamBridge } from "./api/v1_stream.ts";
 import { authMiddleware, loadAuth } from "./auth.ts";
 import { bootstrap } from "./bootstrap.ts";
 import { createPlatformAdapter } from "./platform.ts";
 import { createStoreExtension } from "./extensions/store.ts";
+import { loadStoreIndex } from "./extensions/store_config.ts";
 import { createCronExtension } from "./extensions/crons.ts";
 import { createAssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 import { loadCustomApp, loadMiddleware } from "./plugins.ts";
 
-const { runtime, config, mode } = await bootstrap();
+const { runtime, config, mode, telemetry } = await bootstrap();
 const app = new Hono();
+if (telemetry) app.use("*", telemetry.middleware());
 const corsOptions = config.value.http?.cors;
 const origins = corsOptions?.allow_origins ?? ["*"];
 app.use("*", cors({
@@ -33,11 +36,13 @@ if (config.value.http?.middleware_order === "auth_first") {
   app.use("*", auth);
 }
 
-const kv = await createStoreExtension(runtime.store);
+const index = await loadStoreIndex(config.value.store?.index, config.directory);
+const kv = await createStoreExtension(runtime.store, { index });
 const crons = await createCronExtension(runtime.store, runtime);
 const versions = await createAssistantVersionsExtension(runtime.store);
 const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), { store: kv, crons, versions });
 adapter.v2 = new NativeV2Bridge(adapter, runtime);
+adapter.v1 = new V1StreamBridge(adapter, runtime);
 app.route("/", createApi(adapter));
 const custom = await loadCustomApp(config);
 if (custom) app.route("/", custom);
@@ -48,6 +53,6 @@ const port = Number(process.env.PORT ?? 2026);
 const hostname = process.env.HOST ?? "127.0.0.1";
 const server = Bun.serve({ port, hostname, fetch: app.fetch });
 console.info(`Valida listening on http://${hostname}:${server.port} (${mode})`);
-const shutdown = async () => { server.stop(); crons.stop(); await runtime.close(); };
+const shutdown = async () => { server.stop(); crons.stop(); await runtime.close(); await telemetry?.shutdown(); };
 process.once("SIGINT", () => { void shutdown(); });
 process.once("SIGTERM", () => { void shutdown(); });
