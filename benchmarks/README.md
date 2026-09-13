@@ -10,7 +10,7 @@ The matching graphs are [`../examples/benchmark/graph.ts`](../examples/benchmark
 
 Both applications used one API container with its worker inside, limited to 4 CPUs and 4 GiB of RAM and swap disabled. Aegra used `REDIS_BROKER_ENABLED=true`, `WORKER_COUNT=1`, `N_JOBS_PER_WORKER=50`, `AUTH_TYPE=noop`, and `CRON_ENABLED=false`. Valida used `EXECUTION_MODE=distributed`, `RUN_WORKER_IN_API=true`, and `execution.concurrency=50`. Telemetry exporters were disabled for both. They connected to the same `pgvector/pgvector:0.8.6-pg17-bookworm` PostgreSQL container (2 CPUs, 1 GiB) and `redis:7-alpine` container (1 CPU, 256 MiB), on separate databases and Redis DB indexes. Restart PostgreSQL and Redis between platform trials to reduce file-cache carryover, and keep only the app under test running. PostgreSQL `memory.current` still includes reclaimable file cache, so compare app memory and `memory.stat` anonymous memory first.
 
-Run the platforms sequentially. For a comparison, repeat each platform three times in alternating order (the recorded order was A-V-V-A-A-V) while keeping its graph, input, in-flight limit and shared-service limits identical. A single run per platform on the recorded local ports looks like this:
+Run the platforms sequentially. For a comparison, repeat each platform three times in alternating order (the corrected recorded order was V-A-A-V-V-A) while keeping its graph, input, in-flight limit and shared-service limits identical. The first published A-V-V-A-A-V series was invalid because the SDK request limit was left at four. A single run per platform on the recorded local ports looks like this:
 
 ```bash
 bun benchmarks/workload.ts \
