@@ -6,12 +6,16 @@ The default full run warms up on a separate thread, creates 50 threads, waits 15
 
 The independent `cgroup_sampler.ts` process starts before warmup. It resolves each named Docker container to its host cgroup v2 files, samples `cpu.stat`, `memory.current`, and `memory.stat` about every 110 ms, and saves raw time series plus phase summaries. CPU percent uses one core as 100%; a stack using two full cores reports 200%. The summary includes app-only and whole-stack metrics (app, PostgreSQL, Redis): idle average CPU and median RAM, load peak CPU from intervals of at least 100 ms and peak RAM, sample counts and interval counts. Anonymous and file-backed memory are reported separately because PostgreSQL file cache can grow between sequential runs. A separate file retains every sample and per-container metrics.
 
-Run the platforms sequentially against the same PostgreSQL and Redis containers. Replace the Valida app container name and URL with the running setup. For a comparison, repeat each platform three times in alternating order (for example V-A-A-V-V-A) while keeping its graph, input, in-flight limit, app CPU/memory limits and shared services identical. A single run per platform looks like this:
+The matching graphs are [`../examples/benchmark/graph.ts`](../examples/benchmark/graph.ts) and [`aegra/graph.py`](aegra/graph.py). Both have `add` and `double` nodes with a 200 ms async delay in each node. The Valida config is [`../examples/benchmark/valida.json`](../examples/benchmark/valida.json); Aegra's is [`aegra/aegra.json`](aegra/aegra.json). For the recorded comparison, Aegra was checked out at `bbc784646e6a3912cf05b6b9de0054fdf50a36b7` (aegra-api 0.10.5) and built with its official `deployments/docker/Dockerfile` and `uv.lock`. Valida was built from this repository with Bun 1.4.1.
+
+Both applications used one API container with its worker inside, limited to 4 CPUs and 4 GiB of RAM and swap disabled. Aegra used `REDIS_BROKER_ENABLED=true`, `WORKER_COUNT=1`, `N_JOBS_PER_WORKER=50`, `AUTH_TYPE=noop`, and `CRON_ENABLED=false`. Valida used `EXECUTION_MODE=distributed`, `RUN_WORKER_IN_API=true`, and `execution.concurrency=50`. Telemetry exporters were disabled for both. They connected to the same `pgvector/pgvector:0.8.6-pg17-bookworm` PostgreSQL container (2 CPUs, 1 GiB) and `redis:7-alpine` container (1 CPU, 256 MiB), on separate databases and Redis DB indexes. Restart PostgreSQL and Redis between platform trials to reduce file-cache carryover, and keep only the app under test running. PostgreSQL `memory.current` still includes reclaimable file cache, so compare app memory and `memory.stat` anonymous memory first.
+
+Run the platforms sequentially. For a comparison, repeat each platform three times in alternating order (the recorded order was A-V-V-A-A-V) while keeping its graph, input, in-flight limit and shared-service limits identical. A single run per platform on the recorded local ports looks like this:
 
 ```bash
 bun benchmarks/workload.ts \
-  --platform=valida --url=http://127.0.0.1:2026 \
-  --container=app:valida-bench-api \
+  --platform=valida --url=http://127.0.0.1:22028 \
+  --container=app:valida-bench-app \
   --container=postgres:valida-bench-postgres \
   --container=redis:valida-bench-redis \
   --out=benchmarks/results/valida-1.json
