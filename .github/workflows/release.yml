@@ -87,6 +87,9 @@ jobs:
           tags: |
             ${{ steps.image-name.outputs.name }}:${{ needs.build.outputs.version }}
             ${{ steps.image-name.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.build.outputs.version }}
 
   release:
     needs: [build, image]
