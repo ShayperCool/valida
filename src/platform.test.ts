@@ -115,3 +115,34 @@ test("authenticated stateless runs keep their ephemeral thread private", async (
     await runtime.close();
   }
 });
+
+test("cancelling a queued run releases the thread and terminates its stream", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" }, inline: false });
+  try {
+    runtime.registerGraph({ id: "counter", entrypoint: "add", nodes: {
+      add: value => ({ count: Number(value.count ?? 0) + 1 }),
+    } });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs());
+    const context = { request: new Request("http://valida.test") };
+    const thread = await adapter.threads.create({}, context);
+    const run = await adapter.runs.create(thread.thread_id, {
+      assistant_id: "counter", input: { count: 1 },
+    }, context);
+    expect(run.status).toBe("pending");
+    expect((await adapter.threads.get(thread.thread_id, context))?.status).toBe("busy");
+    expect(await adapter.runs.cancel(thread.thread_id, run.run_id, "interrupt", context)).toBe(true);
+    expect((await adapter.threads.get(thread.thread_id, context))?.status).toBe("idle");
+    const events = [];
+    for await (const event of adapter.runs.events(thread.thread_id, run.run_id, null, context)) {
+      events.push(event);
+    }
+    expect(events.at(-1)).toMatchObject({ event: "end", data: { status: "cancelled" } });
+    const next = await adapter.runs.create(thread.thread_id, {
+      assistant_id: "counter", input: { count: 2 },
+    }, context);
+    expect(next.status).toBe("pending");
+  } finally {
+    await runtime.close();
+  }
+});

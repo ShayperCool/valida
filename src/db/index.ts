@@ -226,7 +226,12 @@ export class Store {
       updated_at = ${now()} WHERE id = ${id}`);
     return this.getRun(id);
   }
-  async cancelRun(id: string): Promise<RunRecord | null> { return this.updateRun(id, { status: "cancelled", leaseUntil: null }); }
+  async cancelRun(id: string): Promise<RunRecord | null> {
+    const rows = await this.rows<Raw>(sql`UPDATE runs SET status = ${"cancelled"},
+      lease_until = ${null}, updated_at = ${now()} WHERE id = ${id}
+      AND status IN (${"pending"}, ${"running"}) RETURNING *`);
+    return rows[0] ? run(rows[0]) : null;
+  }
 
   async createCheckpoint(value: Omit<CheckpointRecord,"id"|"createdAt"> & { id?: string }): Promise<CheckpointRecord> {
     const id = value.id ?? crypto.randomUUID(), stamp = now();
@@ -246,10 +251,19 @@ export class Store {
   }
 
   async appendEvent(runId: string, name: string, data: unknown): Promise<EventRecord> {
-    const rows = await this.rows<{ seq: number }>(sql`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ${runId}`);
-    const seq = Number(rows[0]?.seq ?? 1), stamp = now();
-    await this.exec(sql`INSERT INTO events (run_id, seq, event, data, created_at) VALUES (${runId}, ${seq}, ${name}, ${encode(data)}, ${stamp})`);
-    return { runId, seq, event: name, data, createdAt: stamp };
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const rows = await this.rows<{ seq: number }>(sql`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ${runId}`);
+      const seq = Number(rows[0]?.seq ?? 1), stamp = now();
+      try {
+        await this.exec(sql`INSERT INTO events (run_id, seq, event, data, created_at)
+          VALUES (${runId}, ${seq}, ${name}, ${encode(data)}, ${stamp})`);
+        return { runId, seq, event: name, data, createdAt: stamp };
+      } catch (cause) {
+        const code = (cause as { code?: string })?.code ?? "";
+        if (code !== "23505" && !code.startsWith("SQLITE_CONSTRAINT")) throw cause;
+      }
+    }
+    throw new Error(`Could not append event for run ${runId} after concurrent writes`);
   }
   async listEvents(runId: string, after = 0, limit = 100): Promise<EventRecord[]> {
     return (await this.rows(sql`SELECT * FROM events WHERE run_id = ${runId} AND seq > ${after} ORDER BY seq ASC LIMIT ${limit}`)).map(event);
