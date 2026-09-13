@@ -3,6 +3,11 @@ import type { ApiRequestContext, JsonRecord, PlatformAdapter, Run, StreamEvent }
 import { ApiError } from "./types";
 import type { NativeV2Runtime } from "./native_v2";
 
+export interface V1StreamRuntime extends NativeV2Runtime {
+  streamAll?(runId: string, options?: { after?: number; signal?: AbortSignal }):
+    AsyncIterable<{ id: string; event: string; data: unknown }>;
+}
+
 type Mode = "values" | "updates" | "messages" | "messages-tuple" | "custom" | "events" | "debug" |
   "tasks" | "checkpoints";
 type Part = Pick<StreamEvent, "event" | "data">;
@@ -71,8 +76,8 @@ function updateBlock(state: MessageState, index: number, delta: JsonRecord): voi
   state.blocks[index] = block;
 }
 
-/** Original astream_events callback ancestry is not present in v3; this is a useful v1 trace projection. */
-function rawTrace(event: ProtocolEvent, runId: string): JsonRecord {
+/** Stream chunks have no callback hook; use the closest captured run context. */
+function rawTrace(event: ProtocolEvent, runId: string, captured?: JsonRecord | null): JsonRecord {
   const data = object(event.params.data) ?? {};
   const signal = data.event;
   const node = event.params.node ?? event.params.namespace.at(-1)?.split(":", 1)[0] ?? "root";
@@ -85,18 +90,20 @@ function rawTrace(event: ProtocolEvent, runId: string): JsonRecord {
   } else if (event.method === "lifecycle") {
     kind = signal === "running" || signal === "started" ? "on_chain_start"
       : signal === "completed" || signal === "failed" ? "on_chain_end" : "on_chain_stream";
-  }
+  } else if (event.method === "custom" || event.method.startsWith("custom:")) kind = "on_custom_event";
   const payload = event.method === "messages" && signal === "content-block-delta"
     ? { chunk: { type: "ai", content: object(data.delta)?.text ?? data.delta } }
     : event.method === "updates" ? { chunk: ["updates", data] } : { chunk: event.params.data };
-  return { event: kind, name: node, run_id: String(data.run_id ?? runId), tags: [],
-    metadata: { langgraph_node: node, langgraph_checkpoint_ns: event.params.namespace.join("|") },
-    data: payload, parent_ids: [] };
+  return { event: kind, name: kind === "on_custom_event" ? String(data.name ?? "custom") : node,
+    run_id: String(captured?.run_id ?? data.run_id ?? runId),
+    tags: Array.isArray(captured?.tags) ? captured.tags : [],
+    metadata: captured?.metadata ?? { langgraph_node: node, langgraph_checkpoint_ns: event.params.namespace.join("|") },
+    data: payload, parent_ids: Array.isArray(captured?.parent_ids) ? captured.parent_ids : [] };
 }
 
 /** Projects durable v2 events to the v1 SSE modes used by runs.stream/joinStream. */
 export class V1StreamBridge {
-  constructor(private readonly adapter: PlatformAdapter, private readonly runtime: NativeV2Runtime) {}
+  constructor(private readonly adapter: PlatformAdapter, private readonly runtime: V1StreamRuntime) {}
 
   async *events(
     threadId: string | null, run: Run, body: JsonRecord, context: ApiRequestContext,
@@ -120,14 +127,41 @@ export class V1StreamBridge {
     }
     const messages = new Map<string, MessageState>();
     let lastSource = 0;
-    for await (const item of this.runtime.streamV2(run.run_id, {
-      // Rebuild message accumulation before applying the SSE cursor.
-      after: 0, signal: context.request.signal,
-    })) {
+    let capturedTrace = false;
+    let rootTrace: JsonRecord | null = null;
+    const nodeTraces = new Map<string, JsonRecord>();
+    const records = this.runtime.streamAll
+      ? this.runtime.streamAll(run.run_id, { after: 0, signal: context.request.signal })
+      : (async function* (runtime: V1StreamRuntime) {
+        for await (const item of runtime.streamV2(run.run_id, { after: 0, signal: context.request.signal })) {
+          yield { id: item.id, event: "v2", data: item.event };
+        }
+      })(this.runtime);
+    // Replay from the start so message accumulation and callback ancestry stay intact across reconnects.
+    for await (const item of records) {
       const source = Number(item.id);
       if (!Number.isSafeInteger(source)) continue;
       lastSource = source;
-      const parts = await this.projectNative(item.event, run, modes, subgraphs, messages, context);
+      if (item.event === "trace") {
+        capturedTrace = true;
+        const trace = object(item.data);
+        if (trace?.event === "on_chain_start") {
+          if (Array.isArray(trace.parent_ids) && trace.parent_ids.length === 0) rootTrace = trace;
+          const node = object(trace.metadata)?.langgraph_node;
+          if (typeof node === "string") nodeTraces.set(node, trace);
+        }
+        if (modes.has("events") && trace?.event) {
+          if (afterCursor(source, 0, cursor)) yield { id: `${source}.0`, event: "events", data: item.data };
+        }
+        continue;
+      }
+      if (item.event !== "v2") continue;
+      const native = item.data as ProtocolEvent;
+      const scope = native.params.namespace.length > 0
+        ? nodeTraces.get(native.params.node ?? native.params.namespace[0]!.split(":", 1)[0]!) ?? rootTrace
+        : rootTrace;
+      const parts = await this.projectNative(native, run, modes, subgraphs,
+        messages, context, !capturedTrace, scope);
       for (let index = 0; index < parts.length; index++) {
         if (afterCursor(source, index, cursor)) yield { ...parts[index]!, id: `${source}.${index}` };
       }
@@ -145,7 +179,8 @@ export class V1StreamBridge {
 
   private async projectNative(
     event: ProtocolEvent, run: Run, modes: Set<Mode>, subgraphs: boolean,
-    messages: Map<string, MessageState>, context: ApiRequestContext,
+    messages: Map<string, MessageState>, context: ApiRequestContext, syntheticTrace: boolean,
+    traceContext?: JsonRecord | null,
   ): Promise<Part[]> {
     const result: Part[] = [];
     const { method, params } = event;
@@ -188,7 +223,10 @@ export class V1StreamBridge {
     if (method === "input.requested" && !modes.has("updates")) {
       named("values", { __interrupt__: [params.data] }, false);
     }
-    if (modes.has("events")) named("events", rawTrace(event, run.run_id), false);
+    if (modes.has("events") && (syntheticTrace || ["values", "updates", "custom"].includes(method) ||
+      method.startsWith("custom:"))) {
+      named("events", rawTrace(event, run.run_id, traceContext), false);
+    }
     return result;
   }
 

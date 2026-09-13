@@ -22,10 +22,13 @@ mounts this bridge as `adapter.v2`.
 `adapter.v1 = new V1StreamBridge(adapter, runtime)` before `createApi(adapter)`.
 It reconstructs message chunks and accumulated partial/complete messages from
 durable native events, retains subgraph event names, and replays from SSE IDs.
-The `events` projection has the v1 trace shape, but exact `astream_events`
-callback tags and parent IDs cannot be recovered from the stored v3 protocol
-events. Custom graphs expose their stored legacy modes and synthetic task
-results in `debug`; they do not emit token chunks without a message source.
+Compiled graphs capture LangChain callbacks during the same execution and store
+their real tags, metadata, run IDs, and parent ancestry for the `events` mode.
+Stream chunks without callback hooks use the nearest captured run context. Runs
+created before callback capture retain the synthetic trace projection because
+the original ancestry cannot be recovered from v3 protocol events alone.
+Custom graphs expose their stored legacy modes and synthetic task results in
+`debug`; they do not emit token chunks without a message source.
 
 Upstream references: [Aegra routes](https://github.com/aegra/aegra/tree/main/libs/aegra-api/src/aegra_api/api),
 [LangGraph JS SDK](https://github.com/langchain-ai/langgraphjs/tree/main/libs/sdk/src/client).
