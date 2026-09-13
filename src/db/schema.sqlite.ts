@@ -61,3 +61,12 @@ export const crons = sqliteTable("valida_crons", {
   leaseUntil: text("lease_until"), createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
+
+export const assistantVersions = sqliteTable("valida_assistant_versions", {
+  assistantId: text("assistant_id").notNull(), version: integer("version").notNull(),
+  snapshot: text("snapshot").notNull(), createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.assistantId, table.version] })]);
+
+export const assistantHeads = sqliteTable("valida_assistant_heads", {
+  assistantId: text("assistant_id").primaryKey(), version: integer("version").notNull(),
+});
