@@ -111,7 +111,8 @@ export async function createCronExtension(store: Store, runtime: GraphRuntime): 
     const graph = await graphId(assistantId);
     const payload = parse(row.payload);
     const threadId = row.thread_id == null
-      ? (await runtime.createThread({ metadata: { _ephemeral: true, _cron_id: String(row.cron_id) } })).id
+      ? (await runtime.createThread({ metadata: { _ephemeral: true, _cron_id: String(row.cron_id),
+        ...(row.owner_id ? { _owner: String(row.owner_id) } : {}) } })).id
       : String(row.thread_id);
     return runtime.startRun({
       threadId,
