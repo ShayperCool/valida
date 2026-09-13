@@ -5,6 +5,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store } from "../db/index.js";
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
+import { V1TraceHandler } from "./v1_callbacks.js";
 import { toWire } from "./wire.js";
 export { toWire } from "./wire.js";
 
@@ -494,8 +495,17 @@ export class GraphRuntime {
     let lastV2Seq = -1;
     let sawInterruptUpdate = false;
     const requestedIds = new Set<string>();
+    // Native stream callbacks and the protocol iterator can emit concurrently.
+    // Serialize writes so each event gets a unique, replayable database sequence.
+    let writeTail: Promise<unknown> = Promise.resolve();
+    const append = (name: string, data: unknown) => {
+      const pending = writeTail.then(() => this.store.appendEvent(run.id, name, data));
+      writeTail = pending.catch(() => undefined);
+      return pending;
+    };
     if (graph.streamEvents) {
-      const native = await graph.streamEvents(input, { ...config, version: "v3" });
+      const trace = new V1TraceHandler(event => append("trace", event));
+      const native = await graph.streamEvents(input, { ...config, callbacks: [trace], version: "v3" });
       for await (const event of native) {
         await this.ensureActive(run.id);
         const wire = toWire(event) as ProtocolEvent;
@@ -509,26 +519,27 @@ export class GraphRuntime {
           terminalV2 = wire;
           continue;
         }
-        await this.store.appendEvent(run.id, "v2", wire);
+        await append("v2", wire);
         const data = wire.params.data;
         if (wire.params.namespace.length === 0 && wire.method === "updates") {
           const update = isObject(data) && typeof data.node === "string"
             ? { [data.node]: data.values } : data;
           if (isObject(update) && "__interrupt__" in update) sawInterruptUpdate = true;
-          await this.store.appendEvent(run.id, "updates", update);
+          await append("updates", update);
         } else if (wire.params.namespace.length === 0 && wire.method === "values") {
-          await this.store.appendEvent(run.id, "values", data);
+          await append("values", data);
         } else if (["custom", "tools", "checkpoints", "tasks"].includes(wire.method)) {
-          await this.store.appendEvent(run.id, wire.method, data);
+          await append(wire.method, data);
         }
       }
     } else {
       for await (const chunk of await graph.stream(input, config)) {
         await this.ensureActive(run.id);
         const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
-        await this.store.appendEvent(run.id, mode, toWire(data));
+        await append(mode, toWire(data));
       }
     }
+    await writeTail;
     await this.ensureActive(run.id);
     const latestConfigurable: JsonObject = { ...configurable };
     delete latestConfigurable.checkpoint_id;
@@ -543,7 +554,7 @@ export class GraphRuntime {
       step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
       parentId: previous?.id ?? null });
     const status = interrupts.length || next.length ? "interrupted" : "success";
-    if (interrupts.length && !sawInterruptUpdate) await this.store.appendEvent(run.id, "updates", { __interrupt__: interrupts });
+    if (interrupts.length && !sawInterruptUpdate) await append("updates", { __interrupt__: interrupts });
     if (graph.streamEvents) {
       if (status === "interrupted") {
         let seq = terminalV2?.seq ?? lastV2Seq + 1;
@@ -554,17 +565,17 @@ export class GraphRuntime {
             params: { namespace: [], timestamp: Date.now(), data: {
               interrupt_id: id, payload: isObject(entry) ? entry.value : entry,
             } } };
-          await this.store.appendEvent(run.id, "v2", request);
+          await append("v2", request);
         }
-        await this.store.appendEvent(run.id, "v2", { type: "event", seq, method: "lifecycle",
+        await append("v2", { type: "event", seq, method: "lifecycle",
           params: { namespace: [], timestamp: Date.now(), data: { event: "interrupted", graph_name: "root" } } });
       } else if (terminalV2) {
-        await this.store.appendEvent(run.id, "v2", terminalV2);
+        await append("v2", terminalV2);
       }
     }
     if (!await this.finishRun(run, status, values)) return;
     await this.store.updateThread(run.threadId, { status: status === "success" ? "idle" : "interrupted" });
-    await this.store.appendEvent(run.id, "end", { status, output: values });
+    await append("end", { status, output: values });
   }
 
   async updateState(threadId: string, update: State, asNode?: string): Promise<CheckpointRecord> {
@@ -601,7 +612,24 @@ export class GraphRuntime {
       const batch = await this.store.listEvents(runId, after);
       for (const item of batch) {
         after = item.seq;
-        if (item.event !== "v2") yield { event: item.event, data: item.data, id: String(item.seq) };
+        if (item.event !== "v2" && item.event !== "trace") {
+          yield { event: item.event, data: item.data, id: String(item.seq) };
+        }
+      }
+      const run = await this.store.getRun(runId);
+      if (!run || (completed.has(run.status) && batch.length === 0)) return;
+      await sleep(options.pollMs ?? 100);
+    }
+  }
+  /** Replay and follow every stored event, including v3 envelopes and captured v1 callbacks. */
+  async *streamAll(runId: string, options: StreamOptions = {}): AsyncGenerator<{ event: string; data: unknown; id: string }> {
+    let after = options.after ?? 0;
+    for (;;) {
+      if (options.signal?.aborted) return;
+      const batch = await this.store.listEvents(runId, after);
+      for (const item of batch) {
+        after = item.seq;
+        yield { event: item.event, data: item.data, id: String(item.seq) };
       }
       const run = await this.store.getRun(runId);
       if (!run || (completed.has(run.status) && batch.length === 0)) return;
