@@ -57,6 +57,8 @@ NEXT_PUBLIC_API_URL=http://127.0.0.1:2026 NEXT_PUBLIC_ASSISTANT_ID=echo corepack
 
 Open `http://localhost:3000`. Select `approval` with `?assistantId=approval` to try HITL. We verified chat, follow-up turns, history after reload, regeneration, and Approve/Reject against this UI. For a different host or port, set `NEXT_PUBLIC_API_URL` to Valida's reachable API URL and configure `http.cors.allow_origins` in `valida.json`.
 
+For CopilotKit or another AG-UI client, point its official `HttpAgent` at `POST /ag-ui/:assistantId`. This backend endpoint streams text, graph tool calls/results, state snapshots, and HITL outcomes. It uses the same auth middleware as the Agent Protocol routes. See [AG-UI endpoint](./src/api/ag_ui.md) for the supported event set and current limits. It does not add a UI to this repository.
+
 ## PostgreSQL, Redis, and workers
 
 ```bash
@@ -65,11 +67,17 @@ docker compose up --build
 
 This starts PostgreSQL, Redis, and an API instance that also runs BullMQ jobs. Add separate worker processes with `docker compose --profile extra-workers up --build --scale worker=2`. API instances share the database and queue; put them behind a load balancer when scaling HTTP traffic. Runs and SSE events are stored in PostgreSQL, so a client can create a run through one API instance and read its result through another.
 
+Workers renew a database lease throughout execution and poll PostgreSQL for runnable work if Redis is unavailable. Cancellation from another instance aborts a running graph after its next lease check; custom nodes receive `context.signal` so they can stop long work promptly. The default run deadline is one hour. Set `execution.timeout_ms` in `valida.json` or `RUN_TIMEOUT_MS` in the environment; `0` disables the deadline. The `execution.concurrency`, `execution.lease_ms`, and `execution.recovery_poll_ms` settings tune worker throughput and recovery. A node that ignores abort can still perform external side effects after cancellation, although its late result cannot replace the terminal run state.
+
 For a database-free service stack, use `docker compose -f compose.standalone.yml up --build`. That mode uses a persistent SQLite volume and requires no Redis. To run a separate worker directly, set `EXECUTION_MODE=distributed`, `DATABASE_URL=postgres://...`, and `REDIS_URL=redis://...`, then run `bun run worker`.
+
+Stateless runs retain their internal ephemeral thread for 24 hours so clients can join and replay events. A background sweep then removes completed ephemeral threads and their checkpoints/events. `client.threads.prune(ids)` explicitly deletes finished threads; active runs are skipped. The SDK's `keep_latest` prune strategy is not implemented yet.
 
 Both database schemas live in `src/db/schema.sqlite.ts` and `src/db/schema.pg.ts`. Generated migrations live in `drizzle/sqlite` and `drizzle/pg`. Use `bun run db:generate:sqlite` or `bun run db:generate:pg` after a schema change, followed by the matching `db:migrate:*` command. Startup creates missing tables for local development; the initial Drizzle migration can also be applied to a database already initialized that way.
 
 To try semantic store search without an LLM, start with `VALIDA_CONFIG=examples/valida.semantic.json bun run serve`. That config loads the deterministic embedding function in `examples/embeddings.ts`. A production embedding function can use the same TypeScript module interface; the current index ranks matching rows in application memory on SQLite or PostgreSQL. Items written before enabling an index need to be written again to create embeddings.
+
+For tracing, set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`. HTTP requests and graph runs export spans, including a shared trace across BullMQ workers. `OTEL_TARGETS=LANGFUSE,PHOENIX,GENERIC` sends the same spans to multiple backends. Langfuse uses `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY`, and `LANGFUSE_SECRET_KEY`; Phoenix uses `PHOENIX_COLLECTOR_ENDPOINT` and optional `PHOENIX_API_KEY`. Set `OTEL_CONSOLE_EXPORT=true` for local stdout traces.
 
 ## Authentication and middleware
 
@@ -91,6 +99,6 @@ An auth provider exports `authenticate(request)` and an optional `authorize({ us
 
 ## Current compatibility
 
-Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, namespaced JSON and optional semantic search, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, and RemoteGraph are covered by deterministic integration tests. OpenTelemetry tracing is optional: set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to send HTTP and graph run spans to an OTLP collector. AG-UI from upstream Aegra is still missing. The store returns 501 for semantic queries until an embedding index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
+Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, namespaced JSON and optional semantic search, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, RemoteGraph, and AG-UI `HttpAgent` are covered by deterministic integration tests. OpenTelemetry tracing can fan out to OTLP, Langfuse, and Phoenix. The store returns 501 for semantic queries until an embedding index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
 
 Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime. With a server running, `bun run smoke` exercises the deployed API through the SDK and RemoteGraph. Set `VALIDA_API_URL` and `VALIDA_API_URL_2` to different API instances to verify cross-instance state and execution. Tests use SQLite and deterministic graphs; the distributed path has also been exercised with PostgreSQL, Redis, separate API and worker processes.
