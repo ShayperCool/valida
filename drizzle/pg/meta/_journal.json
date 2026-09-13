@@ -15,6 +15,13 @@
       "when": 1789256690403,
       "tag": "0001_acoustic_namorita",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789257700434,
+      "tag": "0002_even_thaddeus_ross",
+      "breakpoints": true
     }
   ]
 }

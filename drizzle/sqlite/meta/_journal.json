@@ -15,6 +15,13 @@
       "when": 1789256690397,
       "tag": "0001_tiny_pride",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1789257700429,
+      "tag": "0002_overrated_sway",
+      "breakpoints": true
     }
   ]
 }
