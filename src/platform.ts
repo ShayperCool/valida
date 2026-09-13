@@ -266,9 +266,12 @@ export function createPlatformAdapter(
       },
       async prune(payload) {
         const strategy = payload.strategy ?? "delete";
-        if (strategy !== "delete") throw new ApiError(501, `Thread prune strategy '${strategy}' is not implemented`);
-        const count = await pruner.prune(payload.thread_ids as string[], visible);
-        return { pruned_count: count, deleted: count, pruned: 0 };
+        if (strategy !== "delete" && strategy !== "keep_latest") {
+          throw new ApiError(422, `Invalid thread prune strategy '${strategy}'`);
+        }
+        const count = await pruner.prune(payload.thread_ids as string[], visible, strategy);
+        return { pruned_count: count, deleted: strategy === "delete" ? count : 0,
+          pruned: strategy === "keep_latest" ? count : 0 };
       },
     },
     runs: {

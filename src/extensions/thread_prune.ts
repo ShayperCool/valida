@@ -67,8 +67,38 @@ export class ThreadPruner {
     }
   }
 
-  /** Explicit SDK-compatible bulk deletion. Unknown or invisible IDs are skipped. */
-  async prune(ids: string[], visible: (thread: ThreadRecord) => boolean): Promise<number> {
+  /** Preserve one checkpoint per namespace and its pending writes, atomically. */
+  private async keepLatest(row: Candidate): Promise<boolean> {
+    if (!["idle", "error", "interrupted"].includes(row.status)) return false;
+    if (!await this.claim(row)) return false;
+    try {
+      await this.store.transaction([
+        sql`DELETE FROM checkpoints WHERE thread_id = ${row.id} AND id NOT IN (
+          SELECT id FROM checkpoints WHERE thread_id = ${row.id}
+          ORDER BY step DESC, created_at DESC, id DESC LIMIT 1)`,
+        sql`UPDATE checkpoints SET parent_id = ${null} WHERE thread_id = ${row.id}`,
+        sql`DELETE FROM lg_checkpoints WHERE thread_id = ${row.id}
+          AND checkpoint_id <> (SELECT MAX(newest.checkpoint_id) FROM lg_checkpoints AS newest
+            WHERE newest.thread_id = lg_checkpoints.thread_id
+              AND newest.checkpoint_ns = lg_checkpoints.checkpoint_ns)`,
+        sql`DELETE FROM lg_writes WHERE thread_id = ${row.id} AND NOT EXISTS (
+          SELECT 1 FROM lg_checkpoints AS kept WHERE kept.thread_id = lg_writes.thread_id
+            AND kept.checkpoint_ns = lg_writes.checkpoint_ns
+            AND kept.checkpoint_id = lg_writes.checkpoint_id)`,
+        sql`UPDATE lg_checkpoints SET parent_id = ${null} WHERE thread_id = ${row.id}`,
+        sql`UPDATE threads SET status = ${row.status} WHERE id = ${row.id} AND status = ${"busy"}`,
+      ]);
+      return true;
+    } catch (error) {
+      await this.store.exec(sql`UPDATE threads SET status = ${row.status}
+        WHERE id = ${row.id} AND status = ${"busy"}`);
+      throw error;
+    }
+  }
+
+  /** Explicit SDK-compatible pruning. Unknown, invisible, or active IDs are skipped. */
+  async prune(ids: string[], visible: (thread: ThreadRecord) => boolean,
+    strategy: "delete" | "keep_latest" = "delete"): Promise<number> {
     if (!Array.isArray(ids) || ids.length > 1_000 || !ids.every(id => typeof id === "string" && id.length > 0)) {
       throw new ApiError(422, "thread_ids must be an array of at most 1000 non-empty strings");
     }
@@ -76,7 +106,7 @@ export class ThreadPruner {
     for (const id of new Set(ids)) {
       const thread = await this.store.getThread(id);
       if (!thread || !visible(thread)) continue;
-      if (await this.delete(thread)) count++;
+      if (await (strategy === "keep_latest" ? this.keepLatest(thread) : this.delete(thread))) count++;
     }
     return count;
   }

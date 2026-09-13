@@ -102,6 +102,19 @@ export class Store {
     await this.pgDb!.execute(statement);
   }
 
+  /** Execute a fixed SQL batch atomically on one database connection. */
+  async transaction(statements: readonly SQL[]): Promise<void> {
+    if (this.sqliteDb) {
+      this.sqliteDb.transaction(tx => {
+        for (const statement of statements) tx.run(statement);
+      }, { behavior: "immediate" });
+      return;
+    }
+    await this.pgDb!.transaction(async tx => {
+      for (const statement of statements) await tx.execute(statement);
+    });
+  }
+
   async migrate(): Promise<void> {
     // Text-encoded JSON keeps the two schemas equivalent and migration between them mechanical.
     const statements = [
