@@ -16,5 +16,16 @@ blocks, tool events, subgraph namespaces, and thread-wide replay cursors.
 Custom graphs without native events use the legacy projection. `main.ts`
 mounts this bridge as `adapter.v2`.
 
+`V1StreamBridge` serves `runs.stream()` and `runs.joinStream()` with the v1
+`stream_mode` values `values`, `updates`, `messages`, `messages-tuple`, `custom`,
+`events`, `debug`, `tasks`, and `checkpoints`. Attach it as
+`adapter.v1 = new V1StreamBridge(adapter, runtime)` before `createApi(adapter)`.
+It reconstructs message chunks and accumulated partial/complete messages from
+durable native events, retains subgraph event names, and replays from SSE IDs.
+The `events` projection has the v1 trace shape, but exact `astream_events`
+callback tags and parent IDs cannot be recovered from the stored v3 protocol
+events. Custom graphs expose their stored legacy modes and synthetic task
+results in `debug`; they do not emit token chunks without a message source.
+
 Upstream references: [Aegra routes](https://github.com/aegra/aegra/tree/main/libs/aegra-api/src/aegra_api/api),
 [LangGraph JS SDK](https://github.com/langchain-ai/langgraphjs/tree/main/libs/sdk/src/client).
