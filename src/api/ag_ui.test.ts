@@ -3,6 +3,8 @@ import { HttpAgent } from "@ag-ui/client";
 import { EventType, RunAgentInputSchema, type BaseEvent } from "@ag-ui/core";
 import { AIMessage, ToolMessage } from "@langchain/core/messages";
 import { END, MessagesAnnotation, START, StateGraph } from "@langchain/langgraph";
+import { Hono } from "hono";
+import { authMiddleware } from "../auth.ts";
 import { createRuntime } from "../engine/index.ts";
 import { createPlatformAdapter, seedDefaultAssistants } from "../platform.ts";
 import { approval, echo } from "../../examples/graphs.ts";
@@ -114,6 +116,31 @@ test("AG-UI validates official input schema before creating a run", async () => 
       state: {}, messages: [{ id: "u", role: "user", content: "hi" }], tools: [],
       context: [], forwardedProps: {} });
     expect(valid.success).toBe(true);
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("AG-UI uses the configured authentication and run authorization", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" } });
+  try {
+    runtime.registerGraph({ id: "echo", graph: echo });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = new Hono();
+    app.use("*", authMiddleware({
+      authenticate(request) {
+        if (request.headers.get("authorization") !== "Bearer valid") throw new Error("Invalid token");
+        return { identity: "alice" };
+      },
+      authorize(context) { return context.resource === "threads" && context.action === "create_run"; },
+    }));
+    app.route("/", createAgUiApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()), runtime));
+    const body = JSON.stringify({ threadId: crypto.randomUUID() });
+    const request = (authorization?: string) => app.request("/ag-ui/echo", {
+      method: "POST", headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) }, body,
+    });
+    expect((await request()).status).toBe(401);
+    expect((await request("Bearer valid")).status).toBe(422);
   } finally {
     await runtime.close();
   }
