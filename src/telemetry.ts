@@ -3,7 +3,7 @@ import { OTLPTraceExporter as GrpcTraceExporter } from "@opentelemetry/exporter-
 import { OTLPTraceExporter as JsonTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPTraceExporter as ProtoTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
 import { resourceFromAttributes } from "@opentelemetry/resources";
-import { BatchSpanProcessor, SimpleSpanProcessor, type SpanExporter } from "@opentelemetry/sdk-trace-base";
+import { BatchSpanProcessor, ConsoleSpanExporter, SimpleSpanProcessor, type SpanExporter } from "@opentelemetry/sdk-trace-base";
 import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
 import type { MiddlewareHandler } from "hono";
 import { matchedRoutes } from "hono/route";
@@ -15,6 +15,10 @@ export interface TelemetryConfig {
   serviceName: string;
   protocol: OtlpProtocol;
   endpoint: string;
+}
+
+interface ExportTarget extends TelemetryConfig {
+  headers?: Record<string, string>;
 }
 
 export interface TraceCarrier {
@@ -59,11 +63,46 @@ export function resolveTelemetryConfig(env: Environment = process.env): Telemetr
   };
 }
 
-function otlpExporter(config: TelemetryConfig): SpanExporter {
-  const options = { url: config.endpoint };
+function otlpExporter(config: ExportTarget): SpanExporter {
+  const options = { url: config.endpoint, headers: config.headers };
   if (config.protocol === "grpc") return new GrpcTraceExporter(options);
   if (config.protocol === "http/json") return new JsonTraceExporter(options);
   return new ProtoTraceExporter(options);
+}
+
+function parseHeaders(raw?: string): Record<string, string> {
+  return Object.fromEntries((raw ?? "").split(",").flatMap(part => {
+    const at = part.indexOf("=");
+    return at > 0 ? [[part.slice(0, at).trim(), part.slice(at + 1).trim()]] : [];
+  }));
+}
+
+/** Resolves Aegra-compatible OTEL_TARGETS; each target receives the same spans. */
+export function resolveTelemetryTargets(env: Environment = process.env): ExportTarget[] {
+  if (env.OTEL_SDK_DISABLED?.toLowerCase() === "true" || env.OTEL_TRACES_EXPORTER?.toLowerCase() === "none") return [];
+  const named = env.OTEL_TARGETS?.split(",").map(value => value.trim().toUpperCase()).filter(Boolean);
+  const selected = named?.length ? named : ["GENERIC"];
+  const serviceName = env.OTEL_SERVICE_NAME?.trim() || "valida";
+  const targets: ExportTarget[] = [];
+  for (const name of new Set(selected)) {
+    if (name === "GENERIC" || name === "DEFAULT" || name === "OTLP") {
+      if (named?.length && !env.OTEL_EXPORTER_OTLP_ENDPOINT && !env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT) continue;
+      const config = resolveTelemetryConfig({ ...env, OTEL_TRACES_EXPORTER: "otlp" });
+      if (config) targets.push({ ...config, headers: parseHeaders(env.OTEL_EXPORTER_OTLP_HEADERS) });
+    } else if (name === "LANGFUSE") {
+      if (!env.LANGFUSE_PUBLIC_KEY || !env.LANGFUSE_SECRET_KEY) continue;
+      const base = (env.LANGFUSE_BASE_URL || "http://localhost:3000").replace(/\/+$/, "");
+      targets.push({ serviceName, protocol: "http/protobuf", endpoint: `${base}/api/public/otel/v1/traces`,
+        headers: { Authorization: `Basic ${Buffer.from(`${env.LANGFUSE_PUBLIC_KEY}:${env.LANGFUSE_SECRET_KEY}`).toString("base64")}`,
+          "x-langfuse-ingestion-version": "4" } });
+    } else if (name === "PHOENIX") {
+      targets.push({ serviceName, protocol: "http/protobuf",
+        endpoint: env.PHOENIX_COLLECTOR_ENDPOINT || "http://127.0.0.1:6006/v1/traces",
+        headers: env.PHOENIX_API_KEY ? { authorization: `Bearer ${env.PHOENIX_API_KEY}` } : {} });
+    } else throw new Error(`Unsupported OTEL_TARGETS entry: ${name}`);
+  }
+  for (const target of targets) new URL(target.endpoint);
+  return targets;
 }
 
 function exception(span: Span, cause: unknown): void {
@@ -78,17 +117,18 @@ export class Telemetry {
   readonly tracer: Tracer;
 
   constructor(options: {
-    exporter: SpanExporter;
+    exporter: SpanExporter | readonly SpanExporter[];
     serviceName?: string;
     registerGlobal?: boolean;
     /** Simple processing is useful for deterministic tests; production uses batches. */
     processor?: "simple" | "batch";
   }) {
+    const exporters = Array.isArray(options.exporter) ? options.exporter : [options.exporter];
     this.provider = new NodeTracerProvider({
       resource: resourceFromAttributes({ "service.name": options.serviceName ?? "valida" }),
-      spanProcessors: [options.processor === "simple"
-        ? new SimpleSpanProcessor(options.exporter)
-        : new BatchSpanProcessor(options.exporter)],
+      spanProcessors: exporters.map(exporter => options.processor === "simple"
+        ? new SimpleSpanProcessor(exporter)
+        : new BatchSpanProcessor(exporter)),
     });
     if (options.registerGlobal !== false) this.provider.register();
     this.tracer = this.provider.getTracer("valida", "0.1.0");
@@ -174,10 +214,16 @@ export class Telemetry {
 }
 
 export function initializeTelemetryFromEnv(env: Environment = process.env): Telemetry | null {
-  const config = resolveTelemetryConfig(env);
-  if (!config) return null;
+  const targets = resolveTelemetryTargets(env);
+  const consoleEnabled = env.OTEL_SDK_DISABLED?.toLowerCase() !== "true" &&
+    env.OTEL_TRACES_EXPORTER?.toLowerCase() !== "none" &&
+    (env.OTEL_CONSOLE_EXPORT?.toLowerCase() === "true" ||
+      env.OTEL_TRACES_EXPORTER?.split(",").some(value => value.trim().toLowerCase() === "console"));
+  const exporters: SpanExporter[] = targets.map(otlpExporter);
+  if (consoleEnabled) exporters.push(new ConsoleSpanExporter());
+  if (exporters.length === 0) return null;
   return new Telemetry({
-    exporter: otlpExporter(config),
-    serviceName: config.serviceName,
+    exporter: exporters,
+    serviceName: targets[0]?.serviceName ?? env.OTEL_SERVICE_NAME?.trim() ?? "valida",
   });
 }
