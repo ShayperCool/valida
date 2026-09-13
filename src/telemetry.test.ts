@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { context, propagation, SpanKind, SpanStatusCode, trace } from "@opentelemetry/api";
 import { InMemorySpanExporter } from "@opentelemetry/sdk-trace-base";
 import { Hono } from "hono";
-import { initializeTelemetryFromEnv, resolveTelemetryConfig, Telemetry, type TraceCarrier } from "./telemetry.ts";
+import { initializeTelemetryFromEnv, resolveTelemetryConfig, resolveTelemetryTargets, Telemetry, type TraceCarrier } from "./telemetry.ts";
 
 test("OTLP environment selects a trace endpoint and protocol only when enabled", () => {
   expect(resolveTelemetryConfig({})).toBeNull();
@@ -34,6 +34,59 @@ test("OTLP environment selects a trace endpoint and protocol only when enabled",
     OTEL_EXPORTER_OTLP_ENDPOINT: "https://collector.example",
     OTEL_EXPORTER_OTLP_PROTOCOL: "unknown",
   })).toThrow("Unsupported OTLP trace protocol");
+});
+
+test("OTEL_TARGETS resolves generic, Langfuse, and Phoenix exporters", () => {
+  const targets = resolveTelemetryTargets({
+    OTEL_TARGETS: "LANGFUSE,PHOENIX,GENERIC",
+    LANGFUSE_BASE_URL: "https://langfuse.example/",
+    LANGFUSE_PUBLIC_KEY: "public",
+    LANGFUSE_SECRET_KEY: "secret",
+    PHOENIX_COLLECTOR_ENDPOINT: "https://phoenix.example/v1/traces",
+    PHOENIX_API_KEY: "token",
+    OTEL_EXPORTER_OTLP_ENDPOINT: "https://generic.example",
+    OTEL_EXPORTER_OTLP_HEADERS: "X-Env=test",
+  });
+  expect(targets.map(target => target.endpoint)).toEqual([
+    "https://langfuse.example/api/public/otel/v1/traces",
+    "https://phoenix.example/v1/traces",
+    "https://generic.example/v1/traces",
+  ]);
+  expect(targets[0]?.headers?.Authorization).toBe(`Basic ${Buffer.from("public:secret").toString("base64")}`);
+  expect(targets[1]?.headers?.authorization).toBe("Bearer token");
+  expect(targets[2]?.headers?.["X-Env"]).toBe("test");
+  expect(resolveTelemetryTargets({ OTEL_TARGETS: "LANGFUSE" })).toEqual([]);
+  expect(resolveTelemetryTargets({ OTEL_TARGETS: "GENERIC" })).toEqual([]);
+  expect(() => resolveTelemetryTargets({ OTEL_TARGETS: "UNKNOWN" })).toThrow();
+});
+
+test("OTEL_TARGETS fans out the same span to two collectors", async () => {
+  const received: string[][] = [[], []];
+  const collectors = [0, 1].map(index => Bun.serve({ hostname: "127.0.0.1", port: 0,
+    async fetch(request) {
+      received[index]!.push(request.headers.get("content-type") ?? "");
+      await request.arrayBuffer();
+      return new Response(new Uint8Array(), { status: 200 });
+    },
+  }));
+  const telemetry = initializeTelemetryFromEnv({
+    OTEL_TARGETS: "PHOENIX,GENERIC",
+    PHOENIX_COLLECTOR_ENDPOINT: `http://127.0.0.1:${collectors[0]!.port}/v1/traces`,
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: `http://127.0.0.1:${collectors[1]!.port}/v1/traces`,
+  });
+  if (!telemetry) throw new Error("Expected tracing to be enabled");
+  try {
+    await telemetry.withRunSpan({ graphId: "counter", runId: "fanout" }, async () => {});
+    await telemetry.forceFlush();
+    expect(received.map(items => items.length)).toEqual([1, 1]);
+    expect(received.flat().every(value => value.includes("application/x-protobuf"))).toBe(true);
+  } finally {
+    await telemetry.shutdown();
+    for (const collector of collectors) collector.stop(true);
+    trace.disable();
+    context.disable();
+    propagation.disable();
+  }
 });
 
 test("HTTP and graph run spans export in memory with inherited and queued trace context", async () => {
