@@ -1,0 +1,9 @@
+{
+  "graphs": {
+    "benchmark": "./graph.ts:benchmark"
+  },
+  "execution": {
+    "mode": "distributed",
+    "concurrency": 50
+  }
+}
