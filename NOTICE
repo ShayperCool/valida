@@ -1,0 +1,9 @@
+Valida is an independent TypeScript and Bun implementation inspired by Aegra
+(https://github.com/aegra/aegra).
+
+Aegra is licensed under Apache License 2.0 and carries the copyright notice
+Copyright (c) 2025 Muhammad Ibrahim (@ibbybuilds). Its attribution is retained
+in this repository's LICENSE.
+
+Valida's own changes are Copyright (c) 2026 Valida contributors and are
+distributed under the same Apache License 2.0.
