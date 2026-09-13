@@ -10,6 +10,7 @@ import type { AssistantVersionsExtension } from "./extensions/assistant_versions
 import { ThreadPruner } from "./extensions/thread_prune.ts";
 import { threadTtlForRequest, type ThreadTtlPolicy } from "./extensions/thread_ttl_config.ts";
 import { copyThread } from "./extensions/thread_copy.ts";
+import { parseThreadProjection, projectThread } from "./api/thread_projection.ts";
 
 type RuntimeHandle = {
   startRun(input: {
@@ -108,8 +109,24 @@ export function createPlatformAdapter(
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
   async function threadWithValues(row: ThreadRecord, knownState?: CheckpointRecord | null): Promise<Thread> {
     const state = knownState === undefined ? await store.getState(row.id) : knownState;
+    const snapshot = state ? await runtime.getGraphState?.(row.id) : null;
+    const interruptTasks = snapshot?.tasks ?? state?.tasks ?? [];
+    const interrupts: JsonRecord = {};
+    for (const [index, task] of interruptTasks.entries()) {
+      const entry = object(task);
+      if (!Array.isArray(entry.interrupts) || !entry.interrupts.length) continue;
+      const key = typeof entry.id === "string" ? entry.id
+        : typeof entry.name === "string" ? entry.name : String(index);
+      interrupts[key] = entry.interrupts;
+    }
+    if (!Object.keys(interrupts).length && (snapshot?.interrupts ?? state?.interrupts)?.length) {
+      interrupts["0"] = snapshot?.interrupts ?? state?.interrupts ?? [];
+    }
+    const checkpoint = snapshot?.config ?? (state
+      ? { thread_id: row.id, checkpoint_id: state.id, checkpoint_ns: "" } : null);
     return { ...apiThread(row), values: state?.values ?? {},
-      state_updated_at: state?.createdAt ?? row.createdAt };
+      state_updated_at: state?.createdAt ?? row.createdAt,
+      config: checkpoint ? { configurable: checkpoint } : {}, interrupts };
   }
   async function getRun(id: string, threadId: string | null) {
     const result = await runtime.getRun(id);
@@ -227,6 +244,7 @@ export function createPlatformAdapter(
         return threadWithValues(row);
       },
       async search(query) {
+        const projection = parseThreadProjection(query);
         if (query.ids != null && (!Array.isArray(query.ids) ||
           !query.ids.every(id => typeof id === "string"))) {
           throw new ApiError(422, "ids must be an array of thread IDs");
@@ -271,7 +289,8 @@ export function createPlatformAdapter(
         });
         const offset = number(query.offset, 0);
         const limit = number(query.limit, 10);
-        return Promise.all(candidates.slice(offset, offset + limit).map(({ row, state }) => threadWithValues(row, state)));
+        return Promise.all(candidates.slice(offset, offset + limit).map(async ({ row, state }) =>
+          projectThread(await threadWithValues(row, state), projection)));
       },
       async get(id) { const row = await getThread(id); return row ? threadWithValues(row) : null; },
       async update(id, payload) {
