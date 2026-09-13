@@ -266,7 +266,9 @@ export function createPlatformAdapter(
         const assistantId = String(payload.assistant_id);
         const assistant = await getAssistant(assistantId);
         if (!assistant) throw new ApiError(404, `Assistant '${assistantId}' not found`);
-        const thread = threadId ? await getThread(threadId) : await store.createThread({ metadata: { _ephemeral: true } });
+        const thread = threadId ? await getThread(threadId) : await store.createThread({
+          metadata: { _ephemeral: true, ...(owner() ? { _owner: owner() } : {}) },
+        });
         if (!thread) throw new ApiError(404, `Thread '${threadId}' not found`);
         await store.updateThread(thread.id, { metadata: {
           ...thread.metadata, graph_id: assistant.graphId, assistant_id: assistantId,

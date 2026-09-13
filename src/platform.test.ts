@@ -91,3 +91,27 @@ test("authorization filters thread reads and replaces create payloads", async ()
     await runtime.close();
   }
 });
+
+test("authenticated stateless runs keep their ephemeral thread private", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    runtime.registerGraph({ id: "echo", entrypoint: "reply", nodes: { reply: value => value } });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = new Hono();
+    app.use("*", authMiddleware({
+      authenticate(request) { return { identity: request.headers.get("x-user") ?? "" }; },
+    }));
+    app.route("/", createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs())));
+    const created = await app.request("/runs", { method: "POST",
+      headers: { "x-user": "alice", "content-type": "application/json" },
+      body: JSON.stringify({ assistant_id: "echo", input: { message: "secret" } }),
+    });
+    expect(created.status).toBe(200);
+    const run = await created.json() as { run_id: string; thread_id: string };
+    expect((await runtime.store.getThread(run.thread_id))?.metadata._owner).toBe("alice");
+    expect((await app.request(`/runs/${run.run_id}`, { headers: { "x-user": "bob" } })).status).toBe(403);
+    expect((await app.request(`/runs/${run.run_id}`, { headers: { "x-user": "alice" } })).status).toBe(200);
+  } finally {
+    await runtime.close();
+  }
+});
