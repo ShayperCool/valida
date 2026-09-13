@@ -77,9 +77,70 @@ test("SDK prune deletes only authorized idle threads and skips active runs", asy
     expect(await runtime.store.getThread(alice.thread_id)).toBeNull();
     expect(await runtime.store.getThread(bob.id)).not.toBeNull();
     expect(await runtime.store.getThread(busy.thread_id)).not.toBeNull();
+    expect(await client.threads.prune([busy.thread_id], { strategy: "keep_latest" }))
+      .toMatchObject({ pruned_count: 0 });
     await runtime.executeRun(run.run_id);
     expect(await client.threads.prune([busy.thread_id])).toMatchObject({ pruned_count: 1 });
     expect(await runtime.store.getThread(busy.thread_id)).toBeNull();
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("SDK keep_latest preserves compiled graph state and future runs", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    const state = Annotation.Root({ count: Annotation<number> });
+    runtime.registerGraph({ id: "counter", graph: new StateGraph(state)
+      .addNode("increment", value => ({ count: (value.count ?? 0) + 1 }))
+      .addEdge(START, "increment").addEdge("increment", END).compile() });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()));
+    const client = new Client({ apiUrl: "http://valida.test", apiKey: null,
+      callerOptions: { maxRetries: 0,
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)) } });
+    const thread = await client.threads.create();
+    await client.runs.wait(thread.thread_id, "counter", { input: { count: 1 } });
+    await client.runs.wait(thread.thread_id, "counter", { input: {} });
+    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
+    expect(await count(runtime, "checkpoints", thread.thread_id)).toBeGreaterThan(1);
+
+    expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
+      .toMatchObject({ pruned_count: 1 });
+    expect(await runtime.store.getThread(thread.thread_id)).not.toBeNull();
+    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
+    expect(await count(runtime, "checkpoints", thread.thread_id)).toBe(1);
+    expect((await client.threads.getState(thread.thread_id)).values).toMatchObject({ count: 3 });
+    expect((await client.threads.getHistory(thread.thread_id, { limit: 100 })).length).toBe(1);
+    expect(await client.runs.wait(thread.thread_id, "counter", { input: {} })).toMatchObject({ count: 4 });
+  } finally {
+    await runtime.close();
+  }
+});
+
+test("keep_latest leaves interrupted native pending writes usable for HITL resume", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    const { approval } = await import("../../examples/graphs.ts");
+    runtime.registerGraph({ id: "approval", graph: approval });
+    await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+    const app = createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()));
+    const client = new Client({ apiUrl: "http://valida.test", apiKey: null,
+      callerOptions: { maxRetries: 0,
+        fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)) } });
+    const thread = await client.threads.create();
+    await client.runs.wait(thread.thread_id, "approval", { input: { proposal: "ship" } });
+    expect((await client.threads.getState(thread.thread_id)).next.length).toBeGreaterThan(0);
+    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
+    expect(await count(runtime, "lg_writes", thread.thread_id)).toBeGreaterThan(0);
+    expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
+      .toMatchObject({ pruned_count: 1 });
+    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
+    expect(await count(runtime, "lg_writes", thread.thread_id)).toBeGreaterThan(0);
+    const resumed = await client.runs.wait(thread.thread_id, "approval", {
+      command: { resume: { decisions: [{ type: "approve" }] } },
+    });
+    expect(resumed).toMatchObject({ approved: true, result: "Approved: ship" });
   } finally {
     await runtime.close();
   }
@@ -100,3 +161,35 @@ test("pruner waits for the terminal end event before deleting", async () => {
     await runtime.close();
   }
 });
+
+if (process.env.VALIDA_TEST_POSTGRES_URL) {
+  test("PostgreSQL keep_latest compacts native checkpoints transactionally", async () => {
+    const runtime = await createRuntime({ db: { dialect: "postgres", url: process.env.VALIDA_TEST_POSTGRES_URL! } });
+    try {
+      const state = Annotation.Root({ count: Annotation<number> });
+      runtime.registerGraph({ id: "counter", graph: new StateGraph(state)
+        .addNode("increment", value => ({ count: (value.count ?? 0) + 1 }))
+        .addEdge(START, "increment").addEdge("increment", END).compile() });
+      await seedDefaultAssistants(runtime.store, runtime.listGraphs());
+      const app = createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs()));
+      const client = new Client({ apiUrl: "http://valida.test", apiKey: null,
+        callerOptions: { maxRetries: 0,
+          fetch: (input: RequestInfo | URL, init?: RequestInit) => app.fetch(new Request(input, init)) } });
+      const thread = await client.threads.create();
+      try {
+        await client.runs.wait(thread.thread_id, "counter", { input: { count: 1 } });
+        await client.runs.wait(thread.thread_id, "counter", { input: {} });
+        expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
+        expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
+          .toMatchObject({ pruned_count: 1 });
+        expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
+        expect((await client.threads.getState(thread.thread_id)).values).toMatchObject({ count: 3 });
+        expect(await client.runs.wait(thread.thread_id, "counter", { input: {} })).toMatchObject({ count: 4 });
+      } finally {
+        await client.threads.delete(thread.thread_id);
+      }
+    } finally {
+      await runtime.close();
+    }
+  });
+}
