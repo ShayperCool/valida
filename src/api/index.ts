@@ -309,8 +309,12 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
       prefix === "/runs" ? null : c.req.param("threadId");
 
     app.post(`${prefix}/stream`, async (c) => {
-      const run = await createRun(c.req.raw, threadId(c), ctx(c));
-      return sse(adapter.runs.events(threadId(c), run.run_id, null, ctx(c)), runHeaders(threadId(c), run.run_id));
+      const payload = await body(c.req.raw);
+      validateRunPayload(payload, threadId(c));
+      const run = await adapter.runs.create(threadId(c), payload, ctx(c));
+      const events = adapter.v1?.events(threadId(c), run, payload, ctx(c))
+        ?? adapter.runs.events(threadId(c), run.run_id, null, ctx(c));
+      return sse(events, runHeaders(threadId(c), run.run_id));
     });
     app.post(`${prefix}/wait`, async (c) => {
       const run = await createRun(c.req.raw, threadId(c), ctx(c));
@@ -324,10 +328,14 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
       const id = c.req.param("runId");
       const run = await adapter.runs.get(threadId(c), id, ctx(c));
       if (!run) return notFound("Run", id);
-      return sse(
-        adapter.runs.events(threadId(c), id, c.req.header("Last-Event-ID") ?? null, ctx(c)),
-        runHeaders(threadId(c), id),
-      );
+      const search = new URL(c.req.url).searchParams;
+      const requestedModes = search.getAll("stream_mode");
+      const payload = { stream_mode: requestedModes.length > 1 ? requestedModes : requestedModes[0] ?? null,
+        stream_subgraphs: search.get("stream_subgraphs") === "true" };
+      const lastEventId = c.req.header("Last-Event-ID") ?? null;
+      const events = adapter.v1?.events(threadId(c), run, payload, ctx(c), lastEventId)
+        ?? adapter.runs.events(threadId(c), id, lastEventId, ctx(c));
+      return sse(events, runHeaders(threadId(c), id));
     });
     app.get(`${prefix}/:runId/join`, async (c) => {
       const id = c.req.param("runId");

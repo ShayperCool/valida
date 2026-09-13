@@ -105,6 +105,11 @@ export interface PlatformAdapter {
     command(threadId: string, body: JsonRecord, context: ApiRequestContext): Promise<JsonRecord>;
     events(threadId: string, body: JsonRecord, context: ApiRequestContext): AsyncIterable<StreamEvent>;
   };
+  /** Optional projection of persisted run events into legacy stream_mode SSE. */
+  v1?: {
+    events(threadId: string | null, run: Run, body: JsonRecord, context: ApiRequestContext,
+      lastEventId?: string | null): AsyncIterable<StreamEvent>;
+  };
   store?: {
     put(payload: JsonRecord, context: ApiRequestContext): Promise<void>;
     get(namespace: string[], key: string, context: ApiRequestContext): Promise<JsonRecord | null>;
