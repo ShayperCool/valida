@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { Client } from "@langchain/langgraph-sdk";
 import { RemoteGraph } from "@langchain/langgraph/remote";
+import { Command } from "@langchain/langgraph";
 
 const primaryUrl = process.env.VALIDA_API_URL ?? "http://127.0.0.1:2026";
 const secondaryUrl = process.env.VALIDA_API_URL_2 ?? primaryUrl;
@@ -54,10 +55,34 @@ assert.equal(record((await secondary.threads.getState(approval.thread_id)).value
 
 const remote = new RemoteGraph({ graphId: "counter", client: secondary });
 assert.equal(record(await remote.invoke({ count: 2, increment: 4 })).count, 6);
+const statelessChunks: unknown[] = [];
+for await (const chunk of await remote.stream({ count: 1, increment: 3 }, { streamMode: "values" })) {
+  statelessChunks.push(chunk);
+}
+assert.equal(record(statelessChunks.at(-1)).count, 4);
 const remoteThread = await primary.threads.create();
 const remoteConfig = { configurable: { thread_id: remoteThread.thread_id } };
 assert.equal(record(await remote.invoke({ count: 2, increment: 4 }, remoteConfig)).count, 6);
 assert.equal(record((await primary.threads.getState(remoteThread.thread_id)).values).count, 6);
+const statefulChunks: unknown[] = [];
+for await (const chunk of await remote.stream({ increment: 2 }, { ...remoteConfig, streamMode: "values" })) {
+  statefulChunks.push(chunk);
+}
+assert.equal(record(statefulChunks.at(-1)).count, 8);
+assert.equal(record((await remote.getState(remoteConfig)).values).count, 8);
+const remoteHistory = [];
+for await (const snapshot of remote.getStateHistory(remoteConfig)) remoteHistory.push(snapshot);
+assert.ok(remoteHistory.length > 2);
+assert.ok(remoteHistory[0]?.config.configurable?.checkpoint_id);
+
+const remoteApproval = new RemoteGraph({ graphId: "approval", client: secondary });
+const approvalThread = await primary.threads.create();
+const approvalConfig = { configurable: { thread_id: approvalThread.thread_id } };
+await assert.rejects(remoteApproval.invoke({ proposal: "RemoteGraph smoke" }, approvalConfig));
+assert.ok((await remoteApproval.getState(approvalConfig)).next.length > 0);
+assert.equal(record(await remoteApproval.invoke(new Command({
+  resume: { decisions: [{ type: "approve" }] },
+}), approvalConfig)).approved, true);
 
 const v2 = secondary.threads.stream({ assistantId: "echo",
   maxReconnectAttempts: 0, streamIdleReconnect: 0 });
@@ -74,5 +99,6 @@ try {
 console.log(JSON.stringify({
   status: "passed", primary: primaryUrl, secondary: secondaryUrl,
   checks: ["assistants", "counter", "cross-instance state", "chat", "checkpoint history",
-    "HITL resume", "RemoteGraph stateless", "RemoteGraph stateful", "v2 stream"],
+    "HITL resume", "RemoteGraph stateless invoke/stream", "RemoteGraph stateful checkpoint/history/stream",
+    "RemoteGraph HITL resume", "v2 stream"],
 }));
