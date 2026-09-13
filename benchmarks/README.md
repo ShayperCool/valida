@@ -30,4 +30,6 @@ bun benchmarks/workload.ts \
 
 Each command writes the workload JSON to `--out` and resource JSON beside it with `.resources.json` appended before the extension. `resource_summary` in the workload file mirrors the idle/load aggregate in the resource file. Container names must refer to running Docker containers on a Linux cgroup v2 host. Include every app or worker container with an additional `--container=app:<name>`; all named containers are counted in `stack`, while only app/worker containers are counted in `app`. Without `--container`, the workload still runs but has no resource report.
 
+The committed resource traces in `results/` are gzip-compressed to keep the repository small; decompress them with `gzip -dc results/<name>.resources.json.gz` before inspecting with `jq` or another JSON tool. New local runs still write uncompressed `.resources.json` files.
+
 For a brief wiring check, use `--warmup-runs=1 --threads=2 --waves=1 --concurrency=2 --idle-ms=300`; this is not a performance measurement. Other options include `--assistant`, `--input-json`, `--result-path`, `--expected-json`, `--run-timeout-ms`, `--resource-period-ms`, and `--resource-out`. The full run defaults to the benchmark input and result above. Any failed or incorrect run appears as an error in its trial record and makes the process exit nonzero.
