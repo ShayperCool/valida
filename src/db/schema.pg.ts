@@ -52,6 +52,11 @@ export const storeItems = pgTable("valida_store_items", {
   updatedAt: text("updated_at").notNull(), expiresAt: text("expires_at"),
 }, table => [primaryKey({ columns: [table.namespace, table.itemKey] })]);
 
+export const storeEmbeddings = pgTable("valida_store_embeddings", {
+  namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),
+  sourceHash: text("source_hash").notNull(), vectors: text("vectors").notNull(),
+}, table => [primaryKey({ columns: [table.namespace, table.itemKey] })]);
+
 export const crons = pgTable("valida_crons", {
   id: text("cron_id").primaryKey(), assistantId: text("assistant_id").notNull(),
   threadId: text("thread_id"), schedule: text("schedule").notNull(),

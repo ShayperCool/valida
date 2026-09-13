@@ -14,6 +14,7 @@ export interface ServerConfig {
     cors?: { allow_origins?: string[]; allow_credentials?: boolean };
   };
   execution?: { mode?: "standalone" | "distributed"; concurrency?: number };
+  store?: { index?: { dims: number; embed: string; fields?: string[] } };
 }
 
 export interface LoadedConfig {
