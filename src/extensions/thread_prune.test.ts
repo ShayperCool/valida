@@ -146,6 +146,23 @@ test("keep_latest leaves interrupted native pending writes usable for HITL resum
   }
 });
 
+test("checkpoint compaction transaction rolls back an incomplete batch", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    const thread = await runtime.store.createThread();
+    await runtime.store.createCheckpoint({ threadId: thread.id, runId: "one", graphId: "counter",
+      step: 0, values: { count: 1 }, next: [], tasks: [], interrupts: [], parentId: null });
+    expect(await count(runtime, "checkpoints", thread.id)).toBe(1);
+    await expect(runtime.store.transaction([
+      sql`DELETE FROM checkpoints WHERE thread_id = ${thread.id}`,
+      sql`INSERT INTO valida_missing_compaction_table (id) VALUES (${thread.id})`,
+    ])).rejects.toThrow();
+    expect(await count(runtime, "checkpoints", thread.id)).toBe(1);
+  } finally {
+    await runtime.close();
+  }
+});
+
 test("pruner waits for the terminal end event before deleting", async () => {
   const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" }, inline: false });
   try {

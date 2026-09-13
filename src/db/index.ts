@@ -279,17 +279,13 @@ export class Store {
   }
 
   async appendEvent(runId: string, name: string, data: unknown): Promise<EventRecord> {
-    for (let attempt = 0; attempt < 20; attempt++) {
-      const rows = await this.rows<{ seq: number }>(sql`SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE run_id = ${runId}`);
-      const seq = Number(rows[0]?.seq ?? 1), stamp = now();
-      try {
-        await this.exec(sql`INSERT INTO events (run_id, seq, event, data, created_at)
-          VALUES (${runId}, ${seq}, ${name}, ${encode(data)}, ${stamp})`);
-        return { runId, seq, event: name, data, createdAt: stamp };
-      } catch (cause) {
-        const code = (cause as { code?: string })?.code ?? "";
-        if (code !== "23505" && !code.startsWith("SQLITE_CONSTRAINT")) throw cause;
-      }
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const stamp = now();
+      const rows = await this.rows<{ seq: number }>(sql`INSERT INTO events (run_id, seq, event, data, created_at)
+        SELECT ${runId}, COALESCE(MAX(seq), 0) + 1, ${name}, ${encode(data)}, ${stamp}
+        FROM events WHERE run_id = ${runId}
+        ON CONFLICT (run_id, seq) DO NOTHING RETURNING seq`);
+      if (rows[0]) return { runId, seq: Number(rows[0].seq), event: name, data, createdAt: stamp };
     }
     throw new Error(`Could not append event for run ${runId} after concurrent writes`);
   }
