@@ -20,7 +20,8 @@ type RuntimeHandle = {
     update?: JsonRecord; goto?: string | string[] }): Promise<RunRecord>;
   getRun(id: string): Promise<RunRecord | null>;
   stream(id: string, options?: { after?: number; pollMs?: number }): AsyncIterable<{ event: string; data: unknown; id: string }>;
-  updateState(threadId: string, update: JsonRecord, asNode?: string): Promise<CheckpointRecord>;
+  updateState(threadId: string, update: JsonRecord, asNode?: string, checkpointId?: string):
+    Promise<CheckpointRecord & { nativeCheckpointId?: string }>;
   getGraph?(id: string): unknown;
   getGraphState?(threadId: string, checkpointId?: string, graphId?: string): Promise<GraphStateSnapshot | null>;
   getGraphHistory?(threadId: string, limit?: number, graphId?: string): Promise<GraphStateSnapshot[]>;
@@ -242,15 +243,39 @@ export function createPlatformAdapter(
       },
       async updateState(id, payload) {
         if (!await getThread(id)) return null;
+        if (payload.checkpoint != null &&
+          (typeof payload.checkpoint !== "object" || Array.isArray(payload.checkpoint))) {
+          throw new ApiError(422, "checkpoint must be an object");
+        }
+        const checkpoint = object(payload.checkpoint);
+        if (checkpoint.thread_id != null && checkpoint.thread_id !== id) {
+          throw new ApiError(422, "checkpoint belongs to another thread");
+        }
+        if (checkpoint.checkpoint_ns != null && checkpoint.checkpoint_ns !== "") {
+          throw new ApiError(422, "Only root checkpoint updates are supported");
+        }
+        const fromObject = checkpoint.checkpoint_id;
+        const fromField = payload.checkpoint_id;
+        if (fromObject != null && fromField != null && fromObject !== fromField) {
+          throw new ApiError(422, "checkpoint and checkpoint_id disagree");
+        }
+        const checkpointId = fromField ?? fromObject;
+        if (checkpointId != null && (typeof checkpointId !== "string" || !checkpointId)) {
+          throw new ApiError(422, "checkpoint_id must be a non-empty string");
+        }
         const previous = await store.getState(id);
-        const row = previous
+        if (checkpointId && (!previous || !await runtime.getGraphState?.(id, checkpointId))) {
+          throw new ApiError(404, `Checkpoint '${checkpointId}' not found`);
+        }
+        const row: CheckpointRecord & { nativeCheckpointId?: string } = previous
           ? await runtime.updateState(id, object(payload.values),
-            typeof payload.as_node === "string" ? payload.as_node : undefined)
+            typeof payload.as_node === "string" ? payload.as_node : undefined,
+            checkpointId as string | undefined)
           : await store.createCheckpoint({
             threadId: id, runId: crypto.randomUUID(), graphId: graphIds[0] ?? "unknown",
             step: 0, values: object(payload.values), next: [], tasks: [], interrupts: [], parentId: null,
           });
-        const native = await runtime.getGraphState?.(id);
+        const native = await runtime.getGraphState?.(id, row.nativeCheckpointId);
         return native?.config ? { ...native.config }
           : { thread_id: id, checkpoint_id: row.id, checkpoint_ns: "" };
       },

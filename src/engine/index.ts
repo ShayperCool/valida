@@ -614,22 +614,47 @@ export class GraphRuntime {
     await append("end", { status, output: values });
   }
 
-  async updateState(threadId: string, update: State, asNode?: string): Promise<CheckpointRecord> {
-    const previous = await this.store.getState(threadId);
-    if (!previous) throw new Error(`Thread ${threadId} has no state`);
-    const registered = this.graphs.get(previous.graphId);
-    if (registered?.kind === "compiled") {
-      await registered.graph.updateState?.({ configurable: { thread_id: threadId } }, update, asNode);
-      const snapshot = await registered.graph.getState({ configurable: { thread_id: threadId } });
-      return this.store.createCheckpoint({ threadId, runId: previous.runId, graphId: previous.graphId,
-        step: previous.step + 1, values: stateOf(toWire(snapshot.values)),
-        next: Array.isArray(snapshot.next) ? snapshot.next.map(String) : [],
-        tasks: Array.isArray(snapshot.tasks) ? snapshot.tasks : [], interrupts: [], parentId: previous.id });
+  async updateState(threadId: string, update: State, asNode?: string, checkpointId?: string):
+    Promise<CheckpointRecord & { nativeCheckpointId?: string }> {
+    const thread = await this.store.getThread(threadId);
+    if (!thread || thread.status === "busy" || !await this.store.claimThread(threadId, [thread.status])) {
+      throw new Error(`Thread ${threadId} is busy or missing`);
     }
-    const values = registered?.kind === "custom" ? this.merge(previous.values, update, registered.graph) : { ...previous.values, ...update };
-    return this.store.createCheckpoint({ threadId, runId: previous.runId, graphId: previous.graphId,
-      step: previous.step + 1, values, next: previous.next, tasks: previous.tasks,
-      interrupts: previous.interrupts, parentId: previous.id });
+    try {
+      const previous = await this.store.getState(threadId);
+      if (!previous) throw new Error(`Thread ${threadId} has no state`);
+      const registered = this.graphs.get(previous.graphId);
+      if (registered?.kind === "compiled") {
+        if (!registered.graph.updateState) throw new Error(`Graph ${previous.graphId} cannot update state`);
+        const config = { configurable: { thread_id: threadId,
+          ...(checkpointId ? { checkpoint_id: checkpointId } : {}) } };
+        const updated = await registered.graph.updateState(config, update, asNode) as
+          { configurable?: { checkpoint_id?: string } } | undefined;
+        const nativeCheckpointId = updated?.configurable?.checkpoint_id;
+        const raw = await registered.graph.getState({ configurable: { thread_id: threadId,
+          ...(nativeCheckpointId ? { checkpoint_id: nativeCheckpointId } : {}) } });
+        const snapshot = this.snapshot(raw);
+        const row = await this.store.createCheckpoint({ threadId, runId: previous.runId,
+          graphId: previous.graphId, step: previous.step + 1, values: snapshot.values,
+          next: snapshot.next, tasks: snapshot.tasks, interrupts: snapshot.interrupts,
+          parentId: checkpointId ? null : previous.id });
+        await this.store.updateThread(threadId, { status: snapshot.interrupts.length || snapshot.next.length
+          ? "interrupted" : "idle" });
+        return { ...row, nativeCheckpointId };
+      }
+      const base = checkpointId ? await this.store.getCheckpoint(checkpointId) : previous;
+      if (!base || base.threadId !== threadId) throw new Error(`Checkpoint ${checkpointId} not found in thread ${threadId}`);
+      const values = registered?.kind === "custom" ? this.merge(base.values, update, registered.graph) : { ...base.values, ...update };
+      const row = await this.store.createCheckpoint({ threadId, runId: previous.runId, graphId: previous.graphId,
+        step: previous.step + 1, values, next: base.next, tasks: base.tasks,
+        interrupts: base.interrupts, parentId: base.id });
+      await this.store.updateThread(threadId, { status: base.interrupts.length || base.next.length
+        ? "interrupted" : "idle" });
+      return row;
+    } catch (error) {
+      await this.store.updateThread(threadId, { status: thread.status });
+      throw error;
+    }
   }
 
   async cancelRun(runId: string): Promise<RunRecord | null> { return this.store.cancelRun(runId); }
