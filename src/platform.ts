@@ -8,6 +8,7 @@ import { currentUser } from "./auth.ts";
 import { matchesAuthorizationFilter } from "./authz.ts";
 import type { AssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 import { ThreadPruner } from "./extensions/thread_prune.ts";
+import { copyThread } from "./extensions/thread_copy.ts";
 
 type RuntimeHandle = {
   startRun(input: {
@@ -259,10 +260,7 @@ export function createPlatformAdapter(
       async copy(id) {
         const original = await getThread(id);
         if (!original) return null;
-        const created = await store.createThread({ metadata: original.metadata });
-        const state = await store.getState(id);
-        if (state) await store.createCheckpoint({ ...state, id: undefined, threadId: created.id, parentId: null });
-        return threadWithValues(created);
+        return threadWithValues(await copyThread(store, original));
       },
       async prune(payload) {
         const strategy = payload.strategy ?? "delete";
