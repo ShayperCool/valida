@@ -32,6 +32,8 @@ test("official AG-UI HttpAgent streams a deterministic graph and reuses its chec
     agent.addMessage({ id: "user-2", role: "user", content: "second" });
     await agent.runAgent();
     expect(agent.messages.at(-1)?.content).toBe("Echo: second");
+    expect(agent.messages.filter(message => message.role === "assistant" && message.content === "Echo: first"))
+      .toHaveLength(1);
     const state = await adapter.threads.getState(agent.threadId, null,
       { request: new Request("http://valida.test") });
     const messages = state?.values.messages as Array<{ id: string; content: string }>;
