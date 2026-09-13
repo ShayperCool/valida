@@ -93,7 +93,11 @@ async function main() {
   const outFile = resolve(option("out", `benchmarks/results/${platform}-${new Date().toISOString().replaceAll(":", "-")}.json`));
   const resourceFile = resolve(option("resource-out", outFile.replace(/\.json$/, "") + ".resources.json"));
   const containers = process.argv.slice(2).filter(arg => arg.startsWith("--container="));
-  const client = new Client({ apiUrl: url, apiKey: null });
+  // The SDK defaults to four concurrent fetches. A wait endpoint that sends
+  // headers only on completion would otherwise benchmark that client limit
+  // instead of the requested number of simultaneous runs.
+  const client = new Client({ apiUrl: url, apiKey: null,
+    callerOptions: { maxConcurrency: concurrency } });
   const canonicalInput = structuredClone(input);
   const inputSha256 = createHash("sha256").update(JSON.stringify(canonicalInput)).digest("hex");
   const report: {
@@ -108,6 +112,7 @@ async function main() {
     input_sha256: inputSha256, expected_result: expected, result_path: resultPath,
     host: { logical_cpus_available: availableParallelism(), total_memory_bytes: totalmem() },
     configuration: { warmup_runs: warmupRuns, threads, waves, concurrency,
+      sdk_max_concurrency: concurrency,
       idle_ms: idleMs, run_timeout_ms: timeoutMs, resource_period_ms: periodMs },
     started_at: new Date().toISOString(), phases: [], trials: [], setup_thread_ids: [] };
   await mkdir(dirname(outFile), { recursive: true });
