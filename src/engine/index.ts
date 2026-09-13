@@ -264,8 +264,9 @@ export class GraphRuntime {
 
   async recoverPendingRuns(): Promise<void> {
     if (!this.inline && !this.workerStarted) return;
-    for (const run of await this.store.listRunnableRuns()) {
-      if (this.graphs.has(run.graphId) && !this.active.has(run.id)) {
+    const graphIds = [...this.graphs.keys()];
+    for (const run of await this.store.listRunnableRuns(100, graphIds)) {
+      if (!this.active.has(run.id)) {
         void this.executeRun(run.id).catch(() => {});
       }
     }
