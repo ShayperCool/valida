@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { customType, index, integer, pgTable, primaryKey, text } from "drizzle-orm/pg-core";
+import { customType, doublePrecision, index, integer, pgTable, primaryKey, text } from "drizzle-orm/pg-core";
 
 // Configured models may have different dimensions, so the HNSW index uses a
 // per-dimension cast and predicate instead of a fixed column dimension.
@@ -20,6 +20,11 @@ export const threads = pgTable("threads", {
   status: text("status").notNull(), createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
+export const threadTtl = pgTable("thread_ttl", {
+  threadId: text("thread_id").primaryKey().references(() => threads.id, { onDelete: "cascade" }),
+  strategy: text("strategy").notNull(), ttlMinutes: doublePrecision("ttl_minutes").notNull(),
+  createdAt: text("created_at").notNull(), expiresAt: text("expires_at").notNull(),
+}, table => [index("thread_ttl_expires_at").on(table.expiresAt)]);
 export const runs = pgTable("runs", {
   id: text("id").primaryKey(), threadId: text("thread_id").notNull(),
   assistantId: text("assistant_id"), graphId: text("graph_id").notNull(),
