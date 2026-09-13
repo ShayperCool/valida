@@ -11,6 +11,7 @@ export { toWire } from "./wire.js";
 export type State = JsonObject;
 export interface NodeContext {
   threadId: string; runId: string; node: string; config: JsonObject;
+  signal: AbortSignal;
   /** Returns the supplied resume value; before that, suspends the current node. */
   interrupt(value: unknown): unknown;
 }
@@ -32,7 +33,10 @@ export interface CompiledGraphLike {
   updateState?(config: JsonObject, values: unknown, asNode?: string): Promise<unknown>;
 }
 export interface CompiledGraphDefinition { id: string; graph: CompiledGraphLike | ((checkpointer: BaseCheckpointSaver) => CompiledGraphLike) }
-export interface RuntimeConfig { db: DatabaseConfig; queue?: QueueConfig; inline?: boolean; telemetry?: Telemetry | null }
+export interface RuntimeConfig {
+  db: DatabaseConfig; queue?: QueueConfig; inline?: boolean; telemetry?: Telemetry | null;
+  runTimeoutMs?: number; runLeaseMs?: number; recoveryPollMs?: number;
+}
 export interface StartRunOptions {
   threadId: string; graphId: string; assistantId?: string | null;
   input?: unknown; config?: JsonObject; metadata?: JsonObject;
@@ -59,6 +63,11 @@ const stateOf = (value: unknown): State => isObject(value) ? value : value == nu
 const ends = (node: string) => node === "END" || node === "__end__";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const completed = new Set(["success", "error", "interrupted", "cancelled"]);
+type RunControl = {
+  controller: AbortController; leaseUntil: string;
+  heartbeat?: Promise<void>; heartbeatTimer?: ReturnType<typeof setInterval>;
+  timeoutTimer?: ReturnType<typeof setTimeout>;
+};
 
 export class GraphRuntime {
   readonly store: Store;
@@ -66,8 +75,13 @@ export class GraphRuntime {
   private readonly queue?: RunQueue;
   private readonly inline: boolean;
   private readonly active = new Set<string>();
+  private readonly controls = new Map<string, RunControl>();
   private readonly telemetry?: Telemetry | null;
-  private readonly recoveryTimer?: ReturnType<typeof setInterval>;
+  private recoveryTimer?: ReturnType<typeof setInterval>;
+  private workerStarted = false;
+  private readonly runTimeoutMs: number;
+  private readonly runLeaseMs: number;
+  private readonly recoveryPollMs: number;
   private readonly graphs = new Map<string, { kind: "custom"; graph: GraphDefinition } | { kind: "compiled"; graph: CompiledGraphLike }>();
 
   constructor(store: Store, config: Omit<RuntimeConfig,"db"> = {}) {
@@ -76,8 +90,14 @@ export class GraphRuntime {
     this.checkpointer = new DrizzleCheckpointer(store);
     this.queue = config.queue ? new RunQueue(config.queue) : undefined;
     this.inline = config.inline ?? !config.queue;
+    this.runTimeoutMs = config.runTimeoutMs ?? 3_600_000;
+    this.runLeaseMs = config.runLeaseMs ?? 60_000;
+    this.recoveryPollMs = config.recoveryPollMs ?? 5_000;
+    if (!Number.isFinite(this.runTimeoutMs) || this.runTimeoutMs < 0) throw new Error("runTimeoutMs must be non-negative");
+    if (!Number.isFinite(this.runLeaseMs) || this.runLeaseMs < 50) throw new Error("runLeaseMs must be at least 50 ms");
+    if (!Number.isFinite(this.recoveryPollMs) || this.recoveryPollMs < 10) throw new Error("recoveryPollMs must be at least 10 ms");
     if (this.inline) {
-      this.recoveryTimer = setInterval(() => { void this.recoverPendingRuns(); }, 5_000);
+      this.recoveryTimer = setInterval(() => { void this.recoverPendingRuns(); }, this.recoveryPollMs);
       this.recoveryTimer.unref?.();
     }
   }
@@ -212,17 +232,31 @@ export class GraphRuntime {
   }
 
   private async dispatch(runId: string): Promise<void> {
-    if (this.queue) await this.queue.enqueue(runId);
+    if (this.queue) {
+      try { await this.queue.enqueue(runId); }
+      catch (error) {
+        // The durable database row is the fallback queue. A distributed worker polls it.
+        console.warn(`Redis enqueue failed for run ${runId}; database recovery will process it: ${String(error)}`);
+      }
+    }
     if (this.inline) queueMicrotask(() => { void this.executeRun(runId).catch(() => {}); });
   }
 
   startWorker(): void {
     if (!this.queue) throw new Error("startWorker requires queue.redisUrl");
-    this.queue.start(runId => this.executeRun(runId));
+    const startQueue = () => { void this.queue!.start(runId => this.executeRun(runId)).catch(() => {}); };
+    startQueue();
+    this.workerStarted = true;
+    this.recoveryTimer ??= setInterval(() => {
+      startQueue();
+      void this.recoverPendingRuns();
+    }, this.recoveryPollMs);
+    this.recoveryTimer.unref?.();
+    queueMicrotask(() => { void this.recoverPendingRuns(); });
   }
 
   async recoverPendingRuns(): Promise<void> {
-    if (!this.inline) return;
+    if (!this.inline && !this.workerStarted) return;
     for (const run of await this.store.listRunnableRuns()) {
       if (this.graphs.has(run.graphId) && !this.active.has(run.id)) {
         void this.executeRun(run.id).catch(() => {});
@@ -239,7 +273,7 @@ export class GraphRuntime {
         const before = await this.store.getRun(runId);
         if (!before || completed.has(before.status)) return;
         recovering = before.status === "running";
-        if (await this.store.claimRun(runId)) break;
+        if (await this.store.claimRun(runId, this.runLeaseMs)) break;
         // A stalled BullMQ job may be retried before its database lease expires.
         // Keep the replacement job alive until the owner finishes or the lease expires.
         const remaining = before.leaseUntil ? Date.parse(before.leaseUntil) - Date.now() : 0;
@@ -247,6 +281,28 @@ export class GraphRuntime {
       }
       const run = await this.store.getRun(runId);
       if (!run) return;
+      const control: RunControl = { controller: new AbortController(), leaseUntil: run.leaseUntil! };
+      this.controls.set(runId, control);
+      const renew = () => {
+        if (control.heartbeat || control.controller.signal.aborted) return;
+        control.heartbeat = (async () => {
+          try {
+            const next = await this.store.renewRun(run.id, control.leaseUntil, this.runLeaseMs);
+            if (next) control.leaseUntil = next;
+            else control.controller.abort(new Error("Run cancelled or lease lost"));
+          } catch (error) {
+            control.controller.abort(error);
+          }
+        })().finally(() => { control.heartbeat = undefined; });
+      };
+      control.heartbeatTimer = setInterval(renew, Math.max(10, Math.floor(this.runLeaseMs / 3)));
+      control.heartbeatTimer.unref?.();
+      if (this.runTimeoutMs) {
+        control.timeoutTimer = setTimeout(() => {
+          control.controller.abort(new Error(`Run timed out after ${this.runTimeoutMs} ms`));
+        }, this.runTimeoutMs);
+        control.timeoutTimer.unref?.();
+      }
       const registered = this.graphs.get(run.graphId);
       if (!registered) {
         await this.fail(run, new Error(`Graph ${run.graphId} is not registered in this worker`));
@@ -255,8 +311,15 @@ export class GraphRuntime {
       const execute = async () => {
         await this.store.appendEvent(run.id, "run", { status: "running", recovering });
         try {
-          if (registered.kind === "custom") await this.executeCustom(run, registered.graph, recovering);
-          else await this.executeCompiled(run, registered.graph, recovering);
+          const interrupted = new Promise<never>((_, reject) => {
+            control.controller.signal.addEventListener("abort", () => reject(control.controller.signal.reason), { once: true });
+          });
+          await Promise.race([
+            registered.kind === "custom"
+              ? this.executeCustom(run, registered.graph, recovering)
+              : this.executeCompiled(run, registered.graph, recovering),
+            interrupted,
+          ]);
         } catch (error) { await this.fail(run, error); }
       };
       if (this.telemetry) {
@@ -277,15 +340,49 @@ export class GraphRuntime {
       } else {
         await execute();
       }
-    } finally { this.active.delete(runId); }
+    } finally {
+      const control = this.controls.get(runId);
+      if (control?.heartbeatTimer) clearInterval(control.heartbeatTimer);
+      if (control?.timeoutTimer) clearTimeout(control.timeoutTimer);
+      await control?.heartbeat;
+      this.controls.delete(runId);
+      this.active.delete(runId);
+    }
   }
 
   private async fail(run: RunRecord, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
-    await this.store.updateRun(run.id, { status: "error", error: message, leaseUntil: null });
+    if (!await this.finishRun(run, "error", undefined, message)) return;
     await this.store.updateThread(run.threadId, { status: "error" });
     await this.store.appendEvent(run.id, "error", { message });
     await this.store.appendEvent(run.id, "end", { status: "error" });
+  }
+
+  private async ensureActive(runId: string): Promise<void> {
+    const control = this.controls.get(runId);
+    if (!control) throw new Error("Run execution has ended");
+    if (control.controller.signal.aborted) throw control.controller.signal.reason;
+    let current = await this.store.getRun(runId);
+    // A heartbeat may have renewed between reading the row and reading the local token.
+    if (current?.status === "running" && current.leaseUntil !== control.leaseUntil) {
+      current = await this.store.getRun(runId);
+    }
+    if (current?.status !== "running" || current.leaseUntil !== control.leaseUntil) {
+      control.controller.abort(new Error("Run cancelled or lease lost"));
+      throw control.controller.signal.reason;
+    }
+  }
+
+  private async finishRun(run: RunRecord, status: "success" | "interrupted" | "error",
+    output?: unknown, error?: string): Promise<boolean> {
+    const control = this.controls.get(run.id);
+    if (!control) return false;
+    if (control.heartbeatTimer) clearInterval(control.heartbeatTimer);
+    await control.heartbeat;
+    if (status !== "error" && control.controller.signal.aborted) return false;
+    const finished = await this.store.finishRun(run.id, control.leaseUntil, { status, output, error });
+    if (finished && control.timeoutTimer) clearTimeout(control.timeoutTimer);
+    return Boolean(finished);
   }
 
   private merge(base: State, update: State, graph: GraphDefinition): State {
@@ -297,6 +394,7 @@ export class GraphRuntime {
   }
 
   private async executeCustom(run: RunRecord, graph: GraphDefinition, recovering: boolean): Promise<void> {
+    await this.ensureActive(run.id);
     const previous = await this.store.getState(run.threadId);
     const resuming = run.metadata.__resumeProvided === true;
     const continuing = recovering && previous?.runId === run.id;
@@ -315,6 +413,7 @@ export class GraphRuntime {
         next = Array.isArray(goto) ? [...goto, ...next.slice(1)] : [goto, ...next.slice(1)];
       }
       step++;
+      await this.ensureActive(run.id);
       const updated = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id,
         graphId: graph.id, step, values, next, tasks: [], interrupts: [], parentId });
       parentId = updated.id;
@@ -322,6 +421,7 @@ export class GraphRuntime {
     }
     if (!previous || (!resuming && !continuing)) {
       step++;
+      await this.ensureActive(run.id);
       const initial = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
         step, values, next, tasks: [], interrupts: [], parentId });
       parentId = initial.id;
@@ -330,6 +430,7 @@ export class GraphRuntime {
     const limit = graph.recursionLimit ?? 100;
     let localSteps = 0;
     while (next.length) {
+      await this.ensureActive(run.id);
       if (++localSteps > limit) throw new Error(`Graph ${graph.id} exceeded recursion limit ${limit}`);
       const current = next.shift()!;
       if (ends(current)) continue;
@@ -337,6 +438,7 @@ export class GraphRuntime {
       if (!node) throw new Error(`Graph ${graph.id}: node ${current} is missing`);
       const context: NodeContext = {
         threadId: run.threadId, runId: run.id, node: current, config: run.config,
+        signal: this.controls.get(run.id)!.controller.signal,
         interrupt: value => { if (resuming) return run.resume; throw new GraphInterrupted(value); },
       };
       let result: NodeResult;
@@ -346,6 +448,7 @@ export class GraphRuntime {
         await this.interruptCustom(run, graph, values, [current, ...next], step + 1, parentId, error.value);
         return;
       }
+      await this.ensureActive(run.id);
       const command = isObject(result) && ("goto" in result || "interrupt" in result || "update" in result)
         ? result as NodeCommand : { update: result as State | undefined };
       if (Object.prototype.hasOwnProperty.call(command, "interrupt")) {
@@ -357,31 +460,33 @@ export class GraphRuntime {
       const destination = command.goto ?? graph.edges?.[current] ?? "__end__";
       next = [...(Array.isArray(destination) ? destination : [destination]), ...next].filter(n => !ends(n));
       step++;
+      await this.ensureActive(run.id);
       const saved = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
         step, values, next, tasks: [], interrupts: [], parentId });
       parentId = saved.id;
-      await this.store.renewRun(run.id);
       await this.store.appendEvent(run.id, "updates", { [current]: update });
       await this.store.appendEvent(run.id, "values", values);
-      if ((await this.store.getRun(run.id))?.status === "cancelled") return;
     }
-    await this.store.updateRun(run.id, { status: "success", output: values, leaseUntil: null });
+    if (!await this.finishRun(run, "success", values)) return;
     await this.store.updateThread(run.threadId, { status: "idle" });
     await this.store.appendEvent(run.id, "end", { status: "success", output: values });
   }
 
   private async interruptCustom(run: RunRecord, graph: GraphDefinition, values: State, next: string[], step: number, parentId: string | null, value: unknown): Promise<void> {
+    await this.ensureActive(run.id);
     await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
       step, values, next, tasks: [{ name: next[0] }], interrupts: [{ value }], parentId });
-    await this.store.updateRun(run.id, { status: "interrupted", output: values, leaseUntil: null });
+    if (!await this.finishRun(run, "interrupted", values)) return;
     await this.store.updateThread(run.threadId, { status: "interrupted" });
     await this.store.appendEvent(run.id, "updates", { __interrupt__: [{ value }] });
     await this.store.appendEvent(run.id, "end", { status: "interrupted", output: values });
   }
 
   private async executeCompiled(run: RunRecord, graph: CompiledGraphLike, recovering: boolean): Promise<void> {
+    await this.ensureActive(run.id);
     const configurable = { ...(isObject(run.config.configurable) ? run.config.configurable : {}), thread_id: run.threadId };
-    const config = { ...run.config, configurable, streamMode: ["updates", "values"] };
+    const config = { ...run.config, configurable, streamMode: ["updates", "values"],
+      signal: this.controls.get(run.id)!.controller.signal };
     const native = recovering ? await this.checkpointer.getTuple({ configurable: { thread_id: run.threadId } }) : undefined;
     const resumeNative = native && native.checkpoint.ts >= run.createdAt;
     const input = run.metadata.__resumeProvided === true
@@ -395,6 +500,7 @@ export class GraphRuntime {
     if (graph.streamEvents) {
       const native = await graph.streamEvents(input, { ...config, version: "v3" });
       for await (const event of native) {
+        await this.ensureActive(run.id);
         const wire = toWire(event) as ProtocolEvent;
         lastV2Seq = Math.max(lastV2Seq, wire.seq);
         if (wire.method === "input.requested") {
@@ -418,17 +524,15 @@ export class GraphRuntime {
         } else if (["custom", "tools", "checkpoints", "tasks"].includes(wire.method)) {
           await this.store.appendEvent(run.id, wire.method, data);
         }
-        await this.store.renewRun(run.id);
-        if ((await this.store.getRun(run.id))?.status === "cancelled") return;
       }
     } else {
       for await (const chunk of await graph.stream(input, config)) {
+        await this.ensureActive(run.id);
         const [mode, data] = Array.isArray(chunk) && typeof chunk[0] === "string" ? chunk as [string, unknown] : ["updates", chunk];
         await this.store.appendEvent(run.id, mode, toWire(data));
-        await this.store.renewRun(run.id);
-        if ((await this.store.getRun(run.id))?.status === "cancelled") return;
       }
     }
+    await this.ensureActive(run.id);
     const latestConfigurable: JsonObject = { ...configurable };
     delete latestConfigurable.checkpoint_id;
     const snapshot = await graph.getState({ ...config, configurable: latestConfigurable });
@@ -437,6 +541,7 @@ export class GraphRuntime {
     const tasks = Array.isArray(snapshot.tasks) ? toWire(snapshot.tasks) as unknown[] : [];
     const interrupts = tasks.flatMap((task: unknown) => isObject(task) && Array.isArray(task.interrupts) ? task.interrupts : []);
     const previous = await this.store.getState(run.threadId);
+    await this.ensureActive(run.id);
     await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: run.graphId,
       step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
       parentId: previous?.id ?? null });
@@ -460,7 +565,7 @@ export class GraphRuntime {
         await this.store.appendEvent(run.id, "v2", terminalV2);
       }
     }
-    await this.store.updateRun(run.id, { status, output: values, leaseUntil: null });
+    if (!await this.finishRun(run, status, values)) return;
     await this.store.updateThread(run.threadId, { status: status === "success" ? "idle" : "interrupted" });
     await this.store.appendEvent(run.id, "end", { status, output: values });
   }

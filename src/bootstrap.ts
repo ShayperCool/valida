@@ -23,10 +23,15 @@ export async function bootstrap(options: { workerOnly?: boolean } = {}) {
     throw new Error("Distributed mode requires PostgreSQL DATABASE_URL and REDIS_URL");
   }
   const telemetry = initializeTelemetryFromEnv();
+  const timeoutMs = process.env.RUN_TIMEOUT_MS === undefined
+    ? config.value.execution?.timeout_ms : Number(process.env.RUN_TIMEOUT_MS);
   const runtime = await createRuntime({
     db,
     queue: mode === "distributed" ? { redisUrl: redisUrl!, concurrency: config.value.execution?.concurrency } : undefined,
     inline: mode !== "distributed",
+    runTimeoutMs: timeoutMs,
+    runLeaseMs: config.value.execution?.lease_ms,
+    recoveryPollMs: config.value.execution?.recovery_poll_ms,
     telemetry,
   });
   for (const [id, ref] of Object.entries(config.value.graphs)) {

@@ -215,8 +215,23 @@ export class Store {
       RETURNING id`);
     return claimed.length === 1;
   }
-  async renewRun(id: string, leaseMs = 60_000): Promise<void> {
-    await this.exec(sql`UPDATE runs SET lease_until = ${new Date(Date.now() + leaseMs).toISOString()}, updated_at = ${now()} WHERE id = ${id} AND status = ${"running"}`);
+  /** Extend only the lease this worker actually owns. An expired owner cannot revive a replacement's lease. */
+  async renewRun(id: string, expectedUntil: string, leaseMs = 60_000): Promise<string | null> {
+    const until = new Date(Date.now() + leaseMs).toISOString();
+    const rows = await this.rows<{ lease_until: string }>(sql`UPDATE runs SET lease_until = ${until}, updated_at = ${now()}
+      WHERE id = ${id} AND status = ${"running"} AND lease_until = ${expectedUntil}
+      RETURNING lease_until`);
+    return rows[0]?.lease_until ?? null;
+  }
+  /** Commit a terminal result only if cancellation or another worker did not take this run. */
+  async finishRun(id: string, expectedUntil: string, patch: {
+    status: "success" | "interrupted" | "error"; output?: unknown; error?: string | null;
+  }): Promise<RunRecord | null> {
+    const rows = await this.rows<Raw>(sql`UPDATE runs SET status = ${patch.status},
+      output = ${encode(patch.output)}, error = ${patch.error ?? null}, lease_until = ${null}, updated_at = ${now()}
+      WHERE id = ${id} AND status = ${"running"} AND lease_until = ${expectedUntil}
+      RETURNING *`);
+    return rows[0] ? run(rows[0]) : null;
   }
   async updateRun(id: string, patch: Partial<Pick<RunRecord,"status"|"output"|"error"|"resume"|"leaseUntil"|"metadata">>): Promise<RunRecord | null> {
     const old = await this.getRun(id); if (!old) return null;

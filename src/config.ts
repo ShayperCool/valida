@@ -13,7 +13,10 @@ export interface ServerConfig {
     enable_custom_route_auth?: boolean;
     cors?: { allow_origins?: string[]; allow_credentials?: boolean };
   };
-  execution?: { mode?: "standalone" | "distributed"; concurrency?: number };
+  execution?: {
+    mode?: "standalone" | "distributed"; concurrency?: number;
+    timeout_ms?: number; lease_ms?: number; recovery_poll_ms?: number;
+  };
   store?: { index?: { dims: number; embed: string; fields?: string[] } };
 }
 
