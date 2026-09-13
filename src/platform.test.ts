@@ -146,3 +146,48 @@ test("cancelling a queued run releases the thread and terminates its stream", as
     await runtime.close();
   }
 });
+
+test("assistant read filters cover graph introspection and version routes", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite", url: ":memory:" } });
+  try {
+    runtime.registerGraph({ id: "echo", entrypoint: "reply", nodes: { reply: value => value } });
+    const hidden = await runtime.store.createAssistant({ graphId: "echo", name: "hidden",
+      metadata: { tenant: "bob" } });
+    const visible = await runtime.store.createAssistant({ graphId: "echo", name: "visible",
+      metadata: { tenant: "alice" } });
+    const versions = await createAssistantVersionsExtension(runtime.store);
+    const app = new Hono();
+    app.use("*", authMiddleware({
+      authenticate(request) { return { identity: request.headers.get("x-user") ?? "" }; },
+      authorize(context) {
+        if (context.resource !== "assistants") return true;
+        if (context.action === "read" || context.action === "search") {
+          return { metadata: { tenant: context.user.identity } };
+        }
+        if (context.action === "update" && context.params.assistant_id === hidden.id) return false;
+        return true;
+      },
+    }));
+    app.route("/", createApi(createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), { versions })));
+    const request = (path: string, method = "GET", body?: Record<string, unknown>) => app.request(path, {
+      method, headers: { "x-user": "alice", "content-type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    for (const path of [
+      `/assistants/${hidden.id}`,
+      `/assistants/${hidden.id}/graph`,
+      `/assistants/${hidden.id}/schemas`,
+      `/assistants/${hidden.id}/subgraphs`,
+      `/assistants/${hidden.id}/subgraphs/child`,
+    ]) {
+      expect((await request(path)).status).toBe(403);
+    }
+    expect((await request(`/assistants/${hidden.id}/versions`, "POST", {})).status).toBe(403);
+    expect((await request(`/assistants/${hidden.id}`, "PATCH", { name: "stolen" })).status).toBe(403);
+    expect((await request(`/assistants/${hidden.id}/latest?version=1`, "POST", {})).status).toBe(403);
+    expect((await runtime.store.getAssistant(hidden.id))?.name).toBe("hidden");
+    expect((await request(`/assistants/${visible.id}/graph`)).status).toBe(200);
+  } finally {
+    await runtime.close();
+  }
+});
