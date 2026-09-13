@@ -1,4 +1,6 @@
 import { Command, type ProtocolEvent } from "@langchain/langgraph";
+import { SpanStatusCode } from "@opentelemetry/api";
+import type { Telemetry, TraceCarrier } from "../telemetry.ts";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store } from "../db/index.js";
 import { RunQueue, type QueueConfig } from "../queue/index.js";
@@ -30,7 +32,7 @@ export interface CompiledGraphLike {
   updateState?(config: JsonObject, values: unknown, asNode?: string): Promise<unknown>;
 }
 export interface CompiledGraphDefinition { id: string; graph: CompiledGraphLike | ((checkpointer: BaseCheckpointSaver) => CompiledGraphLike) }
-export interface RuntimeConfig { db: DatabaseConfig; queue?: QueueConfig; inline?: boolean }
+export interface RuntimeConfig { db: DatabaseConfig; queue?: QueueConfig; inline?: boolean; telemetry?: Telemetry | null }
 export interface StartRunOptions {
   threadId: string; graphId: string; assistantId?: string | null;
   input?: unknown; config?: JsonObject; metadata?: JsonObject;
@@ -64,11 +66,13 @@ export class GraphRuntime {
   private readonly queue?: RunQueue;
   private readonly inline: boolean;
   private readonly active = new Set<string>();
+  private readonly telemetry?: Telemetry | null;
   private readonly recoveryTimer?: ReturnType<typeof setInterval>;
   private readonly graphs = new Map<string, { kind: "custom"; graph: GraphDefinition } | { kind: "compiled"; graph: CompiledGraphLike }>();
 
   constructor(store: Store, config: Omit<RuntimeConfig,"db"> = {}) {
     this.store = store;
+    this.telemetry = config.telemetry;
     this.checkpointer = new DrizzleCheckpointer(store);
     this.queue = config.queue ? new RunQueue(config.queue) : undefined;
     this.inline = config.inline ?? !config.queue;
@@ -99,6 +103,7 @@ export class GraphRuntime {
     return entry?.kind === "compiled" && typeof entry.graph.streamEvents === "function";
   }
   getGraph(id: string): GraphDefinition | CompiledGraphLike | null { return this.graphs.get(id)?.graph ?? null; }
+  captureTraceContext(): TraceCarrier | undefined { return this.telemetry?.injectTraceContext(); }
 
   createThread(value: { id?: string; metadata?: JsonObject } = {}) { return this.store.createThread(value); }
   getThread(id: string) { return this.store.getThread(id); }
@@ -247,11 +252,31 @@ export class GraphRuntime {
         await this.fail(run, new Error(`Graph ${run.graphId} is not registered in this worker`));
         return;
       }
-      await this.store.appendEvent(run.id, "run", { status: "running", recovering });
-      try {
-        if (registered.kind === "custom") await this.executeCustom(run, registered.graph, recovering);
-        else await this.executeCompiled(run, registered.graph, recovering);
-      } catch (error) { await this.fail(run, error); }
+      const execute = async () => {
+        await this.store.appendEvent(run.id, "run", { status: "running", recovering });
+        try {
+          if (registered.kind === "custom") await this.executeCustom(run, registered.graph, recovering);
+          else await this.executeCompiled(run, registered.graph, recovering);
+        } catch (error) { await this.fail(run, error); }
+      };
+      if (this.telemetry) {
+        const carrier = run.metadata.__trace_context;
+        await this.telemetry.withRunSpan({ graphId: run.graphId, runId: run.id,
+          threadId: run.threadId, assistantId: run.assistantId,
+          traceContext: isObject(carrier) ? carrier as TraceCarrier : undefined,
+        }, async span => {
+          await execute();
+          const finished = await this.store.getRun(run.id);
+          if (finished) {
+            span.setAttribute("valida.run.status", finished.status);
+            if (finished.status === "error") {
+              span.setStatus({ code: SpanStatusCode.ERROR, message: finished.error ?? undefined });
+            }
+          }
+        });
+      } else {
+        await execute();
+      }
     } finally { this.active.delete(runId); }
   }
 

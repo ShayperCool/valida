@@ -69,6 +69,8 @@ For a database-free service stack, use `docker compose -f compose.standalone.yml
 
 Both database schemas live in `src/db/schema.sqlite.ts` and `src/db/schema.pg.ts`. Generated migrations live in `drizzle/sqlite` and `drizzle/pg`. Use `bun run db:generate:sqlite` or `bun run db:generate:pg` after a schema change, followed by the matching `db:migrate:*` command. Startup creates missing tables for local development; the initial Drizzle migration can also be applied to a database already initialized that way.
 
+To try semantic store search without an LLM, start with `VALIDA_CONFIG=examples/valida.semantic.json bun run serve`. That config loads the deterministic embedding function in `examples/embeddings.ts`. A production embedding function can use the same TypeScript module interface; the current index ranks matching rows in application memory on SQLite or PostgreSQL. Items written before enabling an index need to be written again to create embeddings.
+
 ## Authentication and middleware
 
 Valida accepts TypeScript modules in `valida.json`:
@@ -89,6 +91,6 @@ An auth provider exports `authenticate(request)` and an optional `authorize({ us
 
 ## Current compatibility
 
-Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, exact-key namespaced JSON store, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, and RemoteGraph are covered by deterministic integration tests. Semantic vector search, OpenTelemetry integrations, and AG-UI from upstream Aegra are still missing. The store returns 501 for semantic queries until a vector index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
+Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, namespaced JSON and optional semantic search, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, and RemoteGraph are covered by deterministic integration tests. OpenTelemetry tracing is optional: set `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` to send HTTP and graph run spans to an OTLP collector. AG-UI from upstream Aegra is still missing. The store returns 501 for semantic queries until an embedding index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
 
 Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime. With a server running, `bun run smoke` exercises the deployed API through the SDK and RemoteGraph. Set `VALIDA_API_URL` and `VALIDA_API_URL_2` to different API instances to verify cross-instance state and execution. Tests use SQLite and deterministic graphs; the distributed path has also been exercised with PostgreSQL, Redis, separate API and worker processes.
