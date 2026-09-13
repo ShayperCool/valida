@@ -150,3 +150,33 @@ test("database recovery and a queue callback share the worker concurrency limit"
   expect(started).toBe(5);
   expect(peak).toBe(1);
 });
+
+test("more than one page of unknown graphs cannot starve a later runnable graph", async () => {
+  const runtime = await createRuntime({ db: { dialect: "sqlite" },
+    queue: { redisUrl: "redis://127.0.0.1:29999", name: `valida-starvation-${crypto.randomUUID()}` },
+    inline: false, recoveryPollMs: 20 });
+  runtimes.push(runtime);
+  runtime.registerGraph({ id: "known", entrypoint: "finish", nodes: {
+    finish: () => ({ recovered: true }),
+  } });
+  const pending = async (graphId: string) => {
+    const thread = await runtime.createThread();
+    await runtime.store.claimThread(thread.id, ["idle"]);
+    return runtime.store.createRun({ threadId: thread.id, graphId });
+  };
+  const orphaned = [];
+  for (let index = 0; index < 110; index++) orphaned.push(await pending("removed"));
+  await sleep(5);
+  const valid = await pending("known");
+  expect((await runtime.store.listRunnableRuns(100)).some(run => run.id === valid.id)).toBe(false);
+  runtime.startWorker();
+  let status = "pending";
+  for (let attempt = 0; attempt < 30; attempt++) {
+    status = (await runtime.getRun(valid.id))?.status ?? "missing";
+    if (status === "success") break;
+    await sleep(20);
+  }
+  expect(status).toBe("success");
+  expect((await runtime.getState(valid.threadId))?.values.recovered).toBe(true);
+  expect((await runtime.getRun(orphaned[0]!.id))?.status).toBe("pending");
+});

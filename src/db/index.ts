@@ -215,10 +215,14 @@ export class Store {
   async listRuns(threadId: string, limit = 100): Promise<RunRecord[]> {
     return (await this.rows(sql`SELECT * FROM runs WHERE thread_id = ${threadId} ORDER BY created_at DESC LIMIT ${limit}`)).map(run);
   }
-  async listRunnableRuns(limit = 100): Promise<RunRecord[]> {
+  async listRunnableRuns(limit = 100, graphIds?: string[]): Promise<RunRecord[]> {
+    if (graphIds?.length === 0) return [];
     const stamp = now();
-    return (await this.rows(sql`SELECT * FROM runs WHERE status = ${"pending"}
-      OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp}))
+    const graphFilter = graphIds
+      ? sql`graph_id IN (${sql.join(graphIds.map(id => sql`${id}`), sql`, `)}) AND `
+      : sql``;
+    return (await this.rows(sql`SELECT * FROM runs WHERE ${graphFilter}(status = ${"pending"}
+      OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp})))
       ORDER BY created_at ASC LIMIT ${limit}`)).map(run);
   }
   async claimRun(id: string, leaseMs = 60_000): Promise<boolean> {
