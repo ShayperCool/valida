@@ -18,6 +18,10 @@ export interface ServerConfig {
     timeout_ms?: number; lease_ms?: number; recovery_poll_ms?: number;
   };
   store?: { index?: { dims: number; embed: string; fields?: string[] } };
+  checkpointer?: { ttl?: {
+    default_ttl?: number | null; strategy?: "delete" | "keep_latest";
+    sweep_interval_minutes?: number; sweep_limit?: number;
+  } };
 }
 
 export interface LoadedConfig {
