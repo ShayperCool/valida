@@ -41,6 +41,23 @@ async function body(request: Request): Promise<JsonRecord> {
   }
 }
 
+async function batchBody(request: Request): Promise<JsonRecord[]> {
+  let parsed: unknown;
+  try {
+    parsed = await request.json();
+  } catch {
+    throw new ApiError(400, "Invalid JSON body");
+  }
+  if (!Array.isArray(parsed)) throw new ApiError(422, "Expected an array of runs");
+  const payloads = currentAuthorization.getStore()?.batchPayload ?? parsed;
+  return payloads.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new ApiError(422, `Run at index ${index} must be a JSON object`);
+    }
+    return item as JsonRecord;
+  });
+}
+
 function query(request: Request): JsonRecord {
   return Object.fromEntries(new URL(request.url).searchParams);
 }
@@ -99,6 +116,35 @@ function validateRunPayload(payload: JsonRecord, threadId: string | null): void 
   if (threadId === null && !hasInput && !hasCommand && payload.checkpoint == null && payload.checkpoint_id == null) {
     throw new ApiError(422, "Must specify input, command, or checkpoint");
   }
+}
+
+const batchAliases: Record<string, string> = {
+  assistantId: "assistant_id", checkpointId: "checkpoint_id",
+  streamMode: "stream_mode", streamSubgraphs: "stream_subgraphs",
+  streamResumable: "stream_resumable", feedbackKeys: "feedback_keys",
+  interruptBefore: "interrupt_before", interruptAfter: "interrupt_after",
+  multitaskStrategy: "multitask_strategy", afterSeconds: "after_seconds",
+  ifNotExists: "if_not_exists", checkpointDuring: "checkpoint_during",
+  onCompletion: "on_completion", onDisconnect: "on_disconnect",
+};
+
+function normalizeBatchRun(item: JsonRecord, index: number): JsonRecord {
+  const payload = { ...item };
+  for (const [alias, canonical] of Object.entries(batchAliases)) {
+    if (payload[canonical] === undefined) payload[canonical] = payload[alias];
+    delete payload[alias];
+  }
+  if (payload.thread_id != null || payload.threadId != null) {
+    throw new ApiError(422, `Run at index ${index} must be stateless`);
+  }
+  const configurable = payload.config && typeof payload.config === "object" && !Array.isArray(payload.config)
+    ? (payload.config as JsonRecord).configurable : null;
+  if (configurable && typeof configurable === "object" && !Array.isArray(configurable) &&
+    (configurable as JsonRecord).thread_id != null) {
+    throw new ApiError(422, `Run at index ${index} must be stateless`);
+  }
+  validateRunPayload(payload, null);
+  return payload;
 }
 
 function runHeaders(threadId: string | null, runId: string): Record<string, string> {
@@ -303,6 +349,15 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
     validateRunPayload(payload, threadId);
     return adapter.runs.create(threadId, payload, requestContext);
   }
+
+  app.post("/runs/batch", async (c) => {
+    // The SDK's createBatch contract is stateless. Validate every item before
+    // creating any run so malformed requests cannot start a partial batch.
+    const payloads = (await batchBody(c.req.raw)).map(normalizeBatchRun);
+    const runs = [];
+    for (const payload of payloads) runs.push(await adapter.runs.create(null, payload, ctx(c)));
+    return json(runs);
+  });
 
   for (const prefix of ["/runs", "/threads/:threadId/runs"] as const) {
     const threadId = (c: { req: { param: (name: string) => string } }) =>

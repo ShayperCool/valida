@@ -38,6 +38,8 @@ export interface AuthorizationState extends AuthContext {
   value: AuthValue;
   /** Effective JSON body for create/update/create_run; null for other actions. */
   payload: AuthValue | null;
+  /** Effective per-run payloads for POST /runs/batch after individual authorization. */
+  batchPayload?: AuthValue[];
   /** Restriction returned by authorize for search/read/delete; null if absent. */
   filter: AuthValue | null;
 }
@@ -131,7 +133,7 @@ export function routeAuthTarget(method: string, path: string): AuthTarget | null
   }
 
   if (root === "runs") {
-    if (second && !["stream", "wait"].includes(second)) params.run_id = second;
+    if (second && !["stream", "wait", "batch"].includes(second)) params.run_id = second;
     if (method === "POST") return target("threads", "create_run");
     if (method === "GET") return target("threads", "read");
     return null;
@@ -160,11 +162,10 @@ function isRecord(value: unknown): value is AuthValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-async function jsonBody(request: Request): Promise<AuthValue | null> {
+async function jsonBody(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return null;
   try {
-    const body: unknown = await request.clone().json();
-    return isRecord(body) ? body : null;
+    return await request.clone().json();
   } catch {
     // Let the route report malformed JSON using its normal error handling.
     return null;
@@ -198,14 +199,25 @@ export function authMiddleware(provider: AuthProvider | null, options: { protect
 
     const query = queryValue(url);
     const params = target?.params ?? {};
-    const requestBody = await jsonBody(context.req.raw);
+    const parsedBody = await jsonBody(context.req.raw);
+    const requestBody = isRecord(parsedBody) ? parsedBody : null;
+    const batchBody = path === "/runs/batch" && Array.isArray(parsedBody) && parsedBody.every(isRecord)
+      ? parsedBody as AuthValue[] : null;
     const value: AuthValue = requestBody ?? { ...params, ...query };
     const authContext: AuthContext = {
       user, resource: target?.resource ?? "custom", action: target?.action ?? method.toLowerCase(),
       permissions: user.permissions ?? [], path, method, params, query,
     };
     let decision: AuthDecision = undefined;
-    if (provider.authorize) {
+    let batchPayload: AuthValue[] | undefined;
+    if (batchBody) {
+      batchPayload = [];
+      for (const item of batchBody) {
+        const itemDecision = await provider.authorize?.(authContext, item);
+        if (itemDecision === false) return context.json({ detail: "Forbidden" }, 403);
+        batchPayload.push(isRecord(itemDecision) ? itemDecision : item);
+      }
+    } else if (provider.authorize) {
       decision = await provider.authorize(authContext, value);
       if (decision === false) return context.json({ detail: "Forbidden" }, 403);
     }
@@ -213,6 +225,7 @@ export function authMiddleware(provider: AuthProvider | null, options: { protect
     const state: AuthorizationState = {
       ...authContext, value,
       payload: target && isWrite(target.action) && requestBody !== null ? replacement ?? value : null,
+      batchPayload,
       filter: target && !isWrite(target.action) ? replacement : null,
     };
     return currentUser.run(user, () => currentAuthorization.run(state, next));
