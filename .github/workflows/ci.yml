@@ -1,0 +1,20 @@
+name: Valida CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.1
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
+      - run: bun test
+      - run: docker compose config --quiet
+      - run: docker compose -f compose.standalone.yml config --quiet
+      - run: docker build -t valida-ci .
