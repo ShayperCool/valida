@@ -1,4 +1,4 @@
-CREATE TABLE `thread_ttl` (
+CREATE TABLE IF NOT EXISTS `thread_ttl` (
 	`thread_id` text PRIMARY KEY NOT NULL,
 	`strategy` text NOT NULL,
 	`ttl_minutes` real NOT NULL,
@@ -7,4 +7,4 @@ CREATE TABLE `thread_ttl` (
 	FOREIGN KEY (`thread_id`) REFERENCES `threads`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
-CREATE INDEX `thread_ttl_expires_at` ON `thread_ttl` (`expires_at`);
+CREATE INDEX IF NOT EXISTS `thread_ttl_expires_at` ON `thread_ttl` (`expires_at`);

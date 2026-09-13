@@ -8,6 +8,7 @@ import { currentUser } from "./auth.ts";
 import { matchesAuthorizationFilter } from "./authz.ts";
 import type { AssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 import { ThreadPruner } from "./extensions/thread_prune.ts";
+import { threadTtlForRequest, type ThreadTtlPolicy } from "./extensions/thread_ttl_config.ts";
 import { copyThread } from "./extensions/thread_copy.ts";
 
 type RuntimeHandle = {
@@ -100,9 +101,10 @@ export async function seedDefaultAssistants(store: Store, graphIds: string[]): P
 export function createPlatformAdapter(
   runtime: RuntimeHandle, store: Store, graphIds: string[],
   extensions: { store?: PlatformAdapter["store"]; crons?: PlatformAdapter["crons"];
-    versions?: AssistantVersionsExtension; pruner?: ThreadPruner } = {},
+    versions?: AssistantVersionsExtension; pruner?: ThreadPruner; ttl?: ThreadTtlPolicy | null } = {},
 ): PlatformAdapter {
   const pruner = extensions.pruner ?? new ThreadPruner(store);
+  const ttlPolicy = extensions.ttl ?? null;
   async function getThread(id: string) { return ensureVisible(await store.getThread(id)); }
   async function threadWithValues(row: ThreadRecord, knownState?: CheckpointRecord | null): Promise<Thread> {
     const state = knownState === undefined ? await store.getState(row.id) : knownState;
@@ -220,6 +222,7 @@ export function createPlatformAdapter(
         const row = await store.createThread({
           id: typeof payload.thread_id === "string" ? payload.thread_id : undefined,
           metadata,
+          ttl: threadTtlForRequest(payload.ttl, ttlPolicy, "create") ?? undefined,
         });
         return threadWithValues(row);
       },
@@ -274,7 +277,10 @@ export function createPlatformAdapter(
       async update(id, payload) {
         const row = await getThread(id);
         if (!row) return null;
-        const updated = await store.updateThread(id, { metadata: { ...row.metadata, ...object(payload.metadata) } });
+        const updated = await store.updateThread(id, {
+          metadata: payload.metadata === undefined ? undefined : { ...row.metadata, ...object(payload.metadata) },
+          ttl: threadTtlForRequest(payload.ttl, ttlPolicy, "update"),
+        });
         return updated ? threadWithValues(updated) : null;
       },
       async delete(id) {

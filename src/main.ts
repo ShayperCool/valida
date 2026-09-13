@@ -12,9 +12,11 @@ import { loadStoreIndex } from "./extensions/store_config.ts";
 import { createCronExtension } from "./extensions/crons.ts";
 import { createAssistantVersionsExtension } from "./extensions/assistant_versions.ts";
 import { ThreadPruner } from "./extensions/thread_prune.ts";
+import { resolveThreadTtlPolicy } from "./extensions/thread_ttl_config.ts";
 import { loadCustomApp, loadMiddleware } from "./plugins.ts";
 
 const { runtime, config, mode, telemetry } = await bootstrap();
+const ttlPolicy = resolveThreadTtlPolicy(config.value.checkpointer);
 const app = new Hono();
 if (telemetry) app.use("*", telemetry.middleware());
 const corsOptions = config.value.http?.cors;
@@ -42,8 +44,10 @@ const index = await loadStoreIndex(config.value.store?.index, config.directory);
 const kv = await createStoreExtension(runtime.store, { index });
 const crons = await createCronExtension(runtime.store, runtime);
 const versions = await createAssistantVersionsExtension(runtime.store);
-const pruner = new ThreadPruner(runtime.store);
-const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), { store: kv, crons, versions, pruner });
+const pruner = new ThreadPruner(runtime.store, { ttlSweepLimit: ttlPolicy?.sweepLimit });
+const adapter = createPlatformAdapter(runtime, runtime.store, runtime.listGraphs(), {
+  store: kv, crons, versions, pruner, ttl: ttlPolicy,
+});
 adapter.v2 = new NativeV2Bridge(adapter, runtime);
 adapter.v1 = new V1StreamBridge(adapter, runtime);
 app.route("/", createApi(adapter));
@@ -53,7 +57,7 @@ if (custom) app.route("/", custom);
 
 if (mode === "distributed" && process.env.RUN_WORKER_IN_API !== "false") runtime.startWorker();
 crons.start();
-pruner.start();
+pruner.start(ttlPolicy?.sweepIntervalMs);
 const port = Number(process.env.PORT ?? 2026);
 const hostname = process.env.HOST ?? "127.0.0.1";
 const server = Bun.serve({ port, hostname, fetch: app.fetch });

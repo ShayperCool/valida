@@ -207,10 +207,12 @@ export class Store {
     return one((await this.rows(sql`SELECT * FROM thread_ttl WHERE thread_id = ${id}`)).map(threadTtl));
   }
   async updateThread(id: string, patch: { metadata?: JsonObject; status?: ThreadStatus; ttl?: ThreadTtlSpec | null }): Promise<ThreadRecord | null> {
-    const old = await this.getThread(id); if (!old) return null;
+    if (!await this.getThread(id)) return null;
     const stamp = now();
-    const statements: SQL[] = [sql`UPDATE threads SET metadata = ${encode(patch.metadata ?? old.metadata)},
-      status = ${patch.status ?? old.status}, updated_at = ${stamp} WHERE id = ${id}`];
+    const assignments: SQL[] = [sql`updated_at = ${stamp}`];
+    if (patch.metadata !== undefined) assignments.push(sql`metadata = ${encode(patch.metadata)}`);
+    if (patch.status !== undefined) assignments.push(sql`status = ${patch.status}`);
+    const statements: SQL[] = [sql`UPDATE threads SET ${sql.join(assignments, sql`, `)} WHERE id = ${id}`];
     if (patch.ttl === null) statements.push(sql`DELETE FROM thread_ttl WHERE thread_id = ${id}`);
     else if (patch.ttl) {
       const expiresAt = ttlExpiry(patch.ttl, stamp);
