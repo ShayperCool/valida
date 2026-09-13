@@ -45,6 +45,25 @@ assert.notEqual(batch[0]?.thread_id, batch[1]?.thread_id);
 assert.equal(record(await secondary.runs.join(batch[0]!.thread_id, batch[0]!.run_id)).count, 3);
 assert.equal(record(await secondary.runs.join(batch[1]!.thread_id, batch[1]!.run_id)).count, 9);
 
+const branchThread = await primary.threads.create();
+assert.equal(record(await secondary.runs.wait(branchThread.thread_id, "counter", {
+  input: { count: 10, increment: 1 },
+})).count, 11);
+const branchPoint = (await primary.threads.getState(branchThread.thread_id)).checkpoint?.checkpoint_id;
+assert.ok(branchPoint);
+assert.equal(record(await primary.runs.wait(branchThread.thread_id, "counter", {
+  input: { increment: 1 },
+})).count, 12);
+const oldHead = (await secondary.threads.getState(branchThread.thread_id)).checkpoint?.checkpoint_id;
+assert.ok(oldHead);
+await primary.threads.updateState(branchThread.thread_id, {
+  checkpointId: branchPoint, values: { count: 30 },
+});
+assert.equal(record(await secondary.runs.wait(branchThread.thread_id, "counter", {
+  input: { increment: 1 },
+})).count, 31);
+assert.equal(record((await primary.threads.getState(branchThread.thread_id, oldHead)).values).count, 12);
+
 const chat = await secondary.threads.create();
 const chatValues = record(await primary.runs.wait(chat.thread_id, "echo", {
   input: { messages: [{ role: "human", content: "Valida smoke test" }] },
@@ -114,6 +133,7 @@ try {
 console.log(JSON.stringify({
   status: "passed", primary: primaryUrl, secondary: secondaryUrl,
   checks: ["assistants", "counter", "cross-instance state", "thread copy", "batch runs",
+    "checkpoint branching",
     "chat", "checkpoint history",
     "HITL resume", "RemoteGraph stateless invoke/stream", "RemoteGraph stateful checkpoint/history/stream",
     "RemoteGraph HITL resume", "v2 stream"],
