@@ -29,6 +29,21 @@ const counterValues = record(await secondary.runs.wait(counter.thread_id, "count
 }));
 assert.equal(counterValues.count, 12);
 assert.equal(record((await primary.threads.getState(counter.thread_id)).values).count, 12);
+const copiedCounter = await secondary.threads.copy(counter.thread_id);
+assert.equal(record((await primary.threads.getState(copiedCounter.thread_id)).values).count, 12);
+assert.equal(record(await primary.runs.wait(copiedCounter.thread_id, "counter", {
+  input: { increment: 1 },
+})).count, 13);
+assert.equal(record((await secondary.threads.getState(counter.thread_id)).values).count, 12);
+
+const batch = await primary.runs.createBatch([
+  { assistantId: "counter", input: { count: 1, increment: 2 } },
+  { assistantId: "counter", input: { count: 4, increment: 5 } },
+]);
+assert.equal(batch.length, 2);
+assert.notEqual(batch[0]?.thread_id, batch[1]?.thread_id);
+assert.equal(record(await secondary.runs.join(batch[0]!.thread_id, batch[0]!.run_id)).count, 3);
+assert.equal(record(await secondary.runs.join(batch[1]!.thread_id, batch[1]!.run_id)).count, 9);
 
 const chat = await secondary.threads.create();
 const chatValues = record(await primary.runs.wait(chat.thread_id, "echo", {
@@ -98,7 +113,8 @@ try {
 
 console.log(JSON.stringify({
   status: "passed", primary: primaryUrl, secondary: secondaryUrl,
-  checks: ["assistants", "counter", "cross-instance state", "chat", "checkpoint history",
+  checks: ["assistants", "counter", "cross-instance state", "thread copy", "batch runs",
+    "chat", "checkpoint history",
     "HITL resume", "RemoteGraph stateless invoke/stream", "RemoteGraph stateful checkpoint/history/stream",
     "RemoteGraph HITL resume", "v2 stream"],
 }));
