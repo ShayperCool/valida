@@ -59,3 +59,12 @@ therefore at least once, not exactly once.
 The cron parser supports five-field and six-field expressions with IANA
 timezones. Cron payloads run through the same registered graph runtime as
 ordinary runs. The extension does not deliver webhooks or generate embeddings.
+
+`ThreadPruner` also sweeps opt-in thread TTL rows. `threadTtlForRequest` parses
+SDK `{ ttl, strategy }` values in minutes, and `resolveThreadTtlPolicy` reads
+the optional `checkpointer.ttl` block or `VALIDA_THREAD_TTL` environment value.
+No config or per-thread TTL means no expiry for ordinary threads. The database
+stores the deadline separately from thread metadata, so metadata-only updates
+do not reset it. Expired `delete` rows remove the thread, runs, events, and
+checkpoints; `keep_latest` retains the newest checkpoint and pending writes,
+then schedules the next compaction. Running jobs are skipped until they finish.

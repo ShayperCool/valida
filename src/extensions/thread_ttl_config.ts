@@ -1,5 +1,6 @@
 import type { ServerConfig } from "../config.ts";
-import type { ThreadTtlStrategy } from "../db/index.ts";
+import type { ThreadTtlSpec, ThreadTtlStrategy } from "../db/index.ts";
+import { ApiError } from "../api/types.ts";
 
 export interface ThreadTtlPolicy {
   defaultTtlMinutes: number | null;
@@ -49,4 +50,30 @@ export function resolveThreadTtlPolicy(
     throw new Error("sweep_limit must be an integer from 1 to 10000");
   }
   return { defaultTtlMinutes, strategy, sweepIntervalMs: sweepIntervalMinutes * 60_000, sweepLimit };
+}
+
+/** Parse SDK `{ttl, strategy}` and the `default_ttl` compatibility alias. */
+export function threadTtlForRequest(
+  requested: unknown, policy: ThreadTtlPolicy | null, mode: "create" | "update",
+): ThreadTtlSpec | null | undefined {
+  if (requested === undefined || (requested === null && mode === "create")) {
+    return mode === "create" && policy?.defaultTtlMinutes != null
+      ? { ttlMinutes: policy.defaultTtlMinutes, strategy: policy.strategy } : undefined;
+  }
+  if (requested === null) return null;
+  const value = typeof requested === "number" ? { ttl: requested } : requested;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApiError(422, "ttl must be a minute count or object");
+  }
+  const spec = value as Record<string, unknown>;
+  const minutes = spec.default_ttl ?? spec.ttl ?? policy?.defaultTtlMinutes;
+  if (typeof minutes !== "number" || !Number.isFinite(minutes) ||
+    minutes <= 0 || minutes > MAX_TTL_MINUTES) {
+    throw new ApiError(422, "ttl must be greater than 0 and at most 1000000000 minutes");
+  }
+  const strategy = spec.strategy ?? policy?.strategy ?? "delete";
+  if (strategy !== "delete" && strategy !== "keep_latest") {
+    throw new ApiError(422, "ttl strategy must be delete or keep_latest");
+  }
+  return { ttlMinutes: minutes, strategy };
 }

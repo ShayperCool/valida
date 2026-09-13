@@ -189,8 +189,12 @@ export class ThreadPruner {
     if (this.timer) return;
     if (!Number.isFinite(intervalMs) || intervalMs < 1_000) throw new Error("Thread sweep interval must be at least one second");
     this.timer = setInterval(() => {
-      void (async () => { await this.sweep(); await this.sweepExpired(); })()
-        .catch(error => console.error("Thread sweep failed", error));
+      void (async () => {
+        try { await this.sweep(); }
+        catch (error) { console.error("Stateless thread sweep failed", error); }
+        try { await this.sweepExpired(); }
+        catch (error) { console.error("Thread TTL sweep failed", error); }
+      })();
     }, intervalMs);
     this.timer.unref?.();
   }
