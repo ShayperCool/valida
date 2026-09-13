@@ -23,6 +23,7 @@ describe("Agent Protocol authorization routes", () => {
     ["PATCH", "/runs/crons/cron-1", "crons", "update", { cron_id: "cron-1" }],
     ["DELETE", "/runs/crons/cron-1", "crons", "delete", { cron_id: "cron-1" }],
     ["POST", "/store/items/search", "store", "search", {}],
+    ["POST", "/ag-ui/echo", "threads", "create_run", { assistant_id: "echo" }],
   ])("maps %s %s to %s.%s", (method, path, resource, action, params) => {
     expect(routeAuthTarget(method, path)).toEqual({ resource, action, params });
   });

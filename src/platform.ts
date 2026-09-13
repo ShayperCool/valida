@@ -330,8 +330,8 @@ export function createPlatformAdapter(
         if (!await getThread(threadId)) return [];
         return (await store.listRuns(threadId, number(query.limit, 10))).map(apiRun);
       },
-      async join(threadId, runId) {
-        for (let attempt = 0; attempt < 600; attempt++) {
+      async join(threadId, runId, context) {
+        while (!context.request.signal.aborted) {
           const run = await getRun(runId, threadId);
           if (!run) throw new ApiError(404, `Run '${runId}' not found`);
           if (["success", "interrupted", "error", "cancelled"].includes(run.status)) {
@@ -340,7 +340,7 @@ export function createPlatformAdapter(
           }
           await Bun.sleep(50);
         }
-        throw new ApiError(504, "Run timed out");
+        throw new ApiError(499, "Request aborted while waiting for run");
       },
       async *events(threadId, runId, lastEventId) {
         if (!await getRun(runId, threadId)) throw new ApiError(404, `Run '${runId}' not found`);
