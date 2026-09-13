@@ -251,7 +251,6 @@ export class GraphRuntime {
       startQueue();
       void this.recoverPendingRuns();
     }, this.recoveryPollMs);
-    this.recoveryTimer.unref?.();
     queueMicrotask(() => { void this.recoverPendingRuns(); });
   }
 
@@ -296,12 +295,10 @@ export class GraphRuntime {
         })().finally(() => { control.heartbeat = undefined; });
       };
       control.heartbeatTimer = setInterval(renew, Math.max(10, Math.floor(this.runLeaseMs / 3)));
-      control.heartbeatTimer.unref?.();
       if (this.runTimeoutMs) {
         control.timeoutTimer = setTimeout(() => {
           control.controller.abort(new Error(`Run timed out after ${this.runTimeoutMs} ms`));
         }, this.runTimeoutMs);
-        control.timeoutTimer.unref?.();
       }
       const registered = this.graphs.get(run.graphId);
       if (!registered) {
