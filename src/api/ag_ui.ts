@@ -134,10 +134,12 @@ function nativeEvents(event: ProtocolEvent, messages: Map<string, { id: string; 
 
 async function *projectRun(
   adapter: PlatformAdapter, runtime: NativeV2Runtime, run: Run,
-  input: RunAgentInput, context: ApiRequestContext,
+  input: RunAgentInput, previous: ThreadState | null, context: ApiRequestContext,
 ): AsyncGenerator<Event> {
   const messages = new Map<string, { id: string; started: boolean }>();
   const emittedIds = new Set<string>();
+  const previousIds = new Set((Array.isArray(previous?.values.messages) ? previous.values.messages : [])
+    .map(message => object(message).id).filter((id): id is string => typeof id === "string"));
   const assistant = await adapter.assistants.get(run.assistant_id, context);
   if (runtime.supportsV2(assistant?.graph_id ?? run.assistant_id)) {
     for await (const item of runtime.streamV2(run.run_id, { signal: context.request.signal })) {
@@ -163,7 +165,7 @@ async function *projectRun(
   const values = state?.values ?? object(await adapter.runs.join(run.thread_id, run.run_id, context));
   for (const raw of Array.isArray(values.messages) ? values.messages : []) {
     const message = object(raw);
-    if (typeof message.id === "string" && !emittedIds.has(message.id) &&
+    if (typeof message.id === "string" && !previousIds.has(message.id) && !emittedIds.has(message.id) &&
       !input.messages.some(original => original.id === message.id)) {
       for (const event of messageEvents(message)) yield event;
     }
@@ -206,7 +208,7 @@ export function createAgUiApi(adapter: PlatformAdapter, runtime: NativeV2Runtime
             const started: Event = { type: EventType.RUN_STARTED, threadId: input.threadId,
               runId: input.runId, ...(input.parentRunId ? { parentRunId: input.parentRunId } : {}) };
             controller.enqueue(encoder.encodeBinary(started));
-            for await (const event of projectRun(adapter, runtime, run, input, context)) {
+            for await (const event of projectRun(adapter, runtime, run, input, previous, context)) {
               controller.enqueue(encoder.encodeBinary(event));
             }
           } catch (cause) {
