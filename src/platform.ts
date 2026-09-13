@@ -110,6 +110,11 @@ export function createPlatformAdapter(
   function assistantVisible(record: AssistantRecord): boolean {
     return matchesAuthorizationFilter("assistants", apiAssistant(record));
   }
+  async function visibleAssistant(id: string): Promise<AssistantRecord | null> {
+    const row = await getAssistant(id);
+    if (row && !assistantVisible(row)) throw new ApiError(403, "Assistant access denied");
+    return row;
+  }
 
   return {
     store: extensions.store,
@@ -139,14 +144,13 @@ export function createPlatformAdapter(
         return extensions.versions ? Promise.all(selected.map(assistant => extensions.versions!.decorate(assistant))) : selected;
       },
       async get(id) {
-        const row = await getAssistant(id);
+        const row = await visibleAssistant(id);
         if (!row) return null;
-        if (!assistantVisible(row)) throw new ApiError(403, "Assistant access denied");
         const assistant = apiAssistant(row);
         return extensions.versions ? extensions.versions.decorate(assistant) : assistant;
       },
       async update(id, payload) {
-        const previous = await getAssistant(id);
+        const previous = await visibleAssistant(id);
         if (!previous) return null;
         const row = await store.updateAssistant(id, {
           name: typeof payload.name === "string" ? payload.name : undefined,
@@ -163,32 +167,33 @@ export function createPlatformAdapter(
           ) : assistant;
       },
       async delete(id) {
-        const existing = await store.getAssistant(id);
+        const existing = await visibleAssistant(id);
         if (!existing) return false;
-        if (!assistantVisible(existing)) throw new ApiError(403, "Assistant access denied");
         await store.deleteAssistant(id);
         await extensions.versions?.delete(id);
         return true;
       },
       versions: extensions.versions ? async (id, query, context) => {
-        const row = await getAssistant(id);
+        const row = await visibleAssistant(id);
         if (!row) throw new ApiError(404, `Assistant '${id}' not found`);
-        if (!assistantVisible(row)) throw new ApiError(403, "Assistant access denied");
         return extensions.versions!.versions(id, query, context);
       } : undefined,
-      setLatest: extensions.versions?.setLatest,
+      setLatest: extensions.versions ? async (id, version, context) => {
+        if (!await visibleAssistant(id)) return null;
+        return extensions.versions!.setLatest(id, version, context);
+      } : undefined,
       async graph(id) {
-        const assistant = await getAssistant(id);
+        const assistant = await visibleAssistant(id);
         const graph = assistant && runtime.getGraph?.(assistant.graphId);
         return graph ? { ...describeGraph(graph).graph } : null;
       },
       async schemas(id) {
-        const assistant = await getAssistant(id);
+        const assistant = await visibleAssistant(id);
         const graph = assistant && runtime.getGraph?.(assistant.graphId);
         return graph ? { graph_id: assistant.graphId, ...describeGraph(graph).schemas } : null;
       },
       async subgraphs(id, query) {
-        const assistant = await getAssistant(id);
+        const assistant = await visibleAssistant(id);
         const graph = assistant && runtime.getGraph?.(assistant.graphId);
         if (!graph) return null;
         const subgraphs = describeGraph(graph).subgraphs;
