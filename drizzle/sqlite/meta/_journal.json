@@ -29,6 +29,13 @@
       "when": 1789258018552,
       "tag": "0003_oval_bastion",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1789261520057,
+      "tag": "0004_hot_spitfire",
+      "breakpoints": true
     }
   ]
 }

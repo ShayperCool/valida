@@ -1,4 +1,4 @@
-import { integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const assistants = sqliteTable("assistants", {
   id: text("id").primaryKey(), graphId: text("graph_id").notNull(),
@@ -11,6 +11,11 @@ export const threads = sqliteTable("threads", {
   status: text("status").notNull(), createdAt: text("created_at").notNull(),
   updatedAt: text("updated_at").notNull(),
 });
+export const threadTtl = sqliteTable("thread_ttl", {
+  threadId: text("thread_id").primaryKey().references(() => threads.id, { onDelete: "cascade" }),
+  strategy: text("strategy").notNull(), ttlMinutes: real("ttl_minutes").notNull(),
+  createdAt: text("created_at").notNull(), expiresAt: text("expires_at").notNull(),
+}, table => [index("thread_ttl_expires_at").on(table.expiresAt)]);
 export const runs = sqliteTable("runs", {
   id: text("id").primaryKey(), threadId: text("thread_id").notNull(),
   assistantId: text("assistant_id"), graphId: text("graph_id").notNull(),

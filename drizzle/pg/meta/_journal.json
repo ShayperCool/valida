@@ -36,6 +36,13 @@
       "when": 1789260548754,
       "tag": "0004_lonely_daredevil",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789261523136,
+      "tag": "0005_public_hercules",
+      "breakpoints": true
     }
   ]
 }

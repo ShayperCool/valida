@@ -11,6 +11,11 @@ export type DatabaseConfig =
 export type JsonObject = Record<string, unknown>;
 export type RunStatus = "pending" | "running" | "interrupted" | "success" | "error" | "cancelled";
 export type ThreadStatus = "idle" | "busy" | "interrupted" | "error";
+export type ThreadTtlStrategy = "delete" | "keep_latest";
+export interface ThreadTtlSpec { ttlMinutes: number; strategy: ThreadTtlStrategy }
+export interface ThreadTtlRecord extends ThreadTtlSpec {
+  threadId: string; createdAt: string; expiresAt: string;
+}
 
 export interface AssistantRecord {
   id: string; graphId: string; name: string; description: string | null;
@@ -52,6 +57,18 @@ const thread = (r: Raw): ThreadRecord => ({
   id: String(r.id), metadata: decode(r.metadata, {}), status: r.status as ThreadStatus,
   createdAt: String(r.created_at), updatedAt: String(r.updated_at),
 });
+const threadTtl = (r: Raw): ThreadTtlRecord => ({
+  threadId: String(r.thread_id), strategy: r.strategy as ThreadTtlStrategy,
+  ttlMinutes: Number(r.ttl_minutes), createdAt: String(r.created_at),
+  expiresAt: String(r.expires_at),
+});
+function ttlExpiry(value: ThreadTtlSpec, stamp: string): string {
+  if (!Number.isFinite(value.ttlMinutes) || value.ttlMinutes <= 0 || value.ttlMinutes > 1_000_000_000 ||
+    !["delete", "keep_latest"].includes(value.strategy)) {
+    throw new RangeError("Thread TTL requires 0 < ttlMinutes <= 1000000000 and a supported strategy");
+  }
+  return new Date(new Date(stamp).getTime() + value.ttlMinutes * 60_000).toISOString();
+}
 const run = (r: Raw): RunRecord => ({
   id: String(r.id), threadId: String(r.thread_id), assistantId: r.assistant_id == null ? null : String(r.assistant_id),
   graphId: String(r.graph_id), status: r.status as RunStatus,
@@ -120,12 +137,14 @@ export class Store {
     const statements = [
       `CREATE TABLE IF NOT EXISTS assistants (id TEXT PRIMARY KEY, graph_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT, config TEXT NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS threads (id TEXT PRIMARY KEY, metadata TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+      `CREATE TABLE IF NOT EXISTS thread_ttl (thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE, strategy TEXT NOT NULL, ttl_minutes DOUBLE PRECISION NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, assistant_id TEXT, graph_id TEXT NOT NULL, status TEXT NOT NULL, input TEXT, output TEXT, error TEXT, config TEXT NOT NULL, metadata TEXT NOT NULL, resume TEXT, lease_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT NOT NULL, graph_id TEXT NOT NULL, step INTEGER NOT NULL, state_values TEXT NOT NULL, next TEXT NOT NULL, tasks TEXT NOT NULL, interrupts TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (run_id, seq))`,
       `CREATE TABLE IF NOT EXISTS lg_checkpoints (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, parent_id TEXT, checkpoint_type TEXT NOT NULL, checkpoint_blob TEXT NOT NULL, metadata_type TEXT NOT NULL, metadata_blob TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))`,
       `CREATE TABLE IF NOT EXISTS lg_writes (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, write_idx INTEGER NOT NULL, channel TEXT NOT NULL, value_type TEXT NOT NULL, value_blob TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx))`,
       `CREATE INDEX IF NOT EXISTS runs_thread_created ON runs (thread_id, created_at DESC)`,
+      `CREATE INDEX IF NOT EXISTS thread_ttl_expires_at ON thread_ttl (expires_at)`,
       `CREATE INDEX IF NOT EXISTS runs_status_lease ON runs (status, lease_until)`,
       `CREATE INDEX IF NOT EXISTS checkpoints_thread_created ON checkpoints (thread_id, created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS lg_checkpoints_latest ON lg_checkpoints (thread_id, checkpoint_ns, checkpoint_id DESC)`,
@@ -166,10 +185,16 @@ export class Store {
   }
   async deleteAssistant(id: string): Promise<void> { await this.exec(sql`DELETE FROM assistants WHERE id = ${id}`); }
 
-  async createThread(value: { id?: string; metadata?: JsonObject } = {}): Promise<ThreadRecord> {
+  async createThread(value: { id?: string; metadata?: JsonObject; ttl?: ThreadTtlSpec } = {}): Promise<ThreadRecord> {
     const id = value.id ?? crypto.randomUUID(), stamp = now();
-    await this.exec(sql`INSERT INTO threads (id, metadata, status, created_at, updated_at)
-      VALUES (${id}, ${encode(value.metadata ?? {})}, ${"idle"}, ${stamp}, ${stamp})`);
+    const statements: SQL[] = [sql`INSERT INTO threads (id, metadata, status, created_at, updated_at)
+      VALUES (${id}, ${encode(value.metadata ?? {})}, ${"idle"}, ${stamp}, ${stamp})`];
+    if (value.ttl) {
+      const expiresAt = ttlExpiry(value.ttl, stamp);
+      statements.push(sql`INSERT INTO thread_ttl (thread_id, strategy, ttl_minutes, created_at, expires_at)
+        VALUES (${id}, ${value.ttl.strategy}, ${value.ttl.ttlMinutes}, ${stamp}, ${expiresAt})`);
+    }
+    await this.transaction(statements);
     return (await this.getThread(id))!;
   }
   async getThread(id: string): Promise<ThreadRecord | null> {
@@ -178,9 +203,24 @@ export class Store {
   async listThreads(limit = 100, offset = 0): Promise<ThreadRecord[]> {
     return (await this.rows(sql`SELECT * FROM threads ORDER BY updated_at DESC LIMIT ${limit} OFFSET ${offset}`)).map(thread);
   }
-  async updateThread(id: string, patch: { metadata?: JsonObject; status?: ThreadStatus }): Promise<ThreadRecord | null> {
+  async getThreadTtl(id: string): Promise<ThreadTtlRecord | null> {
+    return one((await this.rows(sql`SELECT * FROM thread_ttl WHERE thread_id = ${id}`)).map(threadTtl));
+  }
+  async updateThread(id: string, patch: { metadata?: JsonObject; status?: ThreadStatus; ttl?: ThreadTtlSpec | null }): Promise<ThreadRecord | null> {
     const old = await this.getThread(id); if (!old) return null;
-    await this.exec(sql`UPDATE threads SET metadata = ${encode(patch.metadata ?? old.metadata)}, status = ${patch.status ?? old.status}, updated_at = ${now()} WHERE id = ${id}`);
+    const stamp = now();
+    const statements: SQL[] = [sql`UPDATE threads SET metadata = ${encode(patch.metadata ?? old.metadata)},
+      status = ${patch.status ?? old.status}, updated_at = ${stamp} WHERE id = ${id}`];
+    if (patch.ttl === null) statements.push(sql`DELETE FROM thread_ttl WHERE thread_id = ${id}`);
+    else if (patch.ttl) {
+      const expiresAt = ttlExpiry(patch.ttl, stamp);
+      statements.push(sql`INSERT INTO thread_ttl (thread_id, strategy, ttl_minutes, created_at, expires_at)
+        VALUES (${id}, ${patch.ttl.strategy}, ${patch.ttl.ttlMinutes}, ${stamp}, ${expiresAt})
+        ON CONFLICT (thread_id) DO UPDATE SET strategy = excluded.strategy,
+          ttl_minutes = excluded.ttl_minutes, expires_at = excluded.expires_at`);
+    }
+    if (statements.length > 1) await this.transaction(statements);
+    else await this.exec(statements[0]!);
     return this.getThread(id);
   }
   async claimThread(id: string, expected: ThreadStatus[]): Promise<boolean> {
@@ -190,12 +230,14 @@ export class Store {
     return rows.length === 1;
   }
   async deleteThread(id: string): Promise<void> {
-    await this.exec(sql`DELETE FROM lg_writes WHERE thread_id = ${id}`);
-    await this.exec(sql`DELETE FROM lg_checkpoints WHERE thread_id = ${id}`);
-    await this.exec(sql`DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE thread_id = ${id})`);
-    await this.exec(sql`DELETE FROM checkpoints WHERE thread_id = ${id}`);
-    await this.exec(sql`DELETE FROM runs WHERE thread_id = ${id}`);
-    await this.exec(sql`DELETE FROM threads WHERE id = ${id}`);
+    await this.transaction([
+      sql`DELETE FROM lg_writes WHERE thread_id = ${id}`,
+      sql`DELETE FROM lg_checkpoints WHERE thread_id = ${id}`,
+      sql`DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE thread_id = ${id})`,
+      sql`DELETE FROM checkpoints WHERE thread_id = ${id}`,
+      sql`DELETE FROM runs WHERE thread_id = ${id}`,
+      sql`DELETE FROM threads WHERE id = ${id}`,
+    ]);
   }
 
   async createRun(value: {
