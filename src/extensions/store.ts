@@ -5,6 +5,7 @@ import type { ApiRequestContext, JsonRecord, PlatformAdapter } from "../api/type
 import { ApiError } from "../api/types.ts";
 import { createRelation } from "./ddl.ts";
 import { matchesAuthorizationFilter } from "../authz.ts";
+import { pgVectorWriteStatements, preparePgvectorStore, searchPgVectors } from "./store_pgvector.ts";
 
 type Row = Record<string, unknown>;
 type StoreBackend = NonNullable<PlatformAdapter["store"]>;
@@ -46,9 +47,9 @@ const endsWith = (parts: string[], suffix: string[]) => suffix.every((part, inde
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 
 function indexFields(fields: unknown): string[] {
-  if (!Array.isArray(fields) || !fields.every(field =>
+  if (!Array.isArray(fields) || fields.length > 64 || !fields.every(field =>
     typeof field === "string" && (field === "$" || (field.length > 0 && field.split(".").every(Boolean))))) {
-    throw new ApiError(422, "index fields must be non-empty JSON paths");
+    throw new ApiError(422, "index fields must be at most 64 non-empty JSON paths");
   }
   return fields;
 }
@@ -112,6 +113,7 @@ export async function createStoreExtension(store: Store, options: StoreOptions =
     vectors TEXT NOT NULL,
     PRIMARY KEY (namespace, item_key)
   )`);
+  if (store.dialect === "postgres" && index) await preparePgvectorStore(store, index.dims);
 
   return {
     async put(payload: JsonRecord, _context?: ApiRequestContext): Promise<void> {
@@ -136,13 +138,21 @@ export async function createStoreExtension(store: Store, options: StoreOptions =
           vectors = entries.map((entry, i) => ({ field: entry.field, vector: embeddings[i]! }));
         }
       }
-      await store.exec(sql`INSERT INTO valida_store_items
+      const itemWrite = sql`INSERT INTO valida_store_items
         (namespace, item_key, item_value, created_at, updated_at, expires_at)
         VALUES (${JSON.stringify(ns)}, ${key}, ${source}, ${stamp}, ${stamp}, ${expiresAt})
         ON CONFLICT (namespace, item_key) DO UPDATE SET
         item_value = excluded.item_value,
         updated_at = excluded.updated_at,
-        expires_at = excluded.expires_at`);
+        expires_at = excluded.expires_at`;
+      if (store.dialect === "postgres" && index) {
+        await store.transaction([itemWrite,
+          ...pgVectorWriteStatements(JSON.stringify(ns), key, source, vectors, index.dims),
+          sql`DELETE FROM valida_store_embeddings WHERE namespace = ${JSON.stringify(ns)} AND item_key = ${key}`]);
+      } else {
+        await store.exec(itemWrite);
+      }
+      if (store.dialect === "postgres" && index) return;
       if (vectors.length) {
         const name = JSON.stringify(ns);
         await store.exec(sql`INSERT INTO valida_store_embeddings (namespace, item_key, source_hash, vectors)
@@ -171,10 +181,14 @@ export async function createStoreExtension(store: Store, options: StoreOptions =
       const row = (await store.rows<Row>(sql`SELECT * FROM valida_store_items
         WHERE namespace = ${name} AND item_key = ${key} LIMIT 1`))[0];
       if (row && !matchesAuthorizationFilter("store", item(row))) throw new ApiError(403, "Store item access denied");
-      await store.exec(sql`DELETE FROM valida_store_items
-        WHERE namespace = ${name} AND item_key = ${key}`);
-      await store.exec(sql`DELETE FROM valida_store_embeddings
-        WHERE namespace = ${name} AND item_key = ${key}`);
+      const statements = [
+        sql`DELETE FROM valida_store_items WHERE namespace = ${name} AND item_key = ${key}`,
+        sql`DELETE FROM valida_store_embeddings WHERE namespace = ${name} AND item_key = ${key}`,
+      ];
+      if (store.dialect === "postgres" && index) {
+        statements.push(sql`DELETE FROM valida_store_vectors WHERE namespace = ${name} AND item_key = ${key}`);
+      }
+      await store.transaction(statements);
     },
     async search(payload: JsonRecord, _context?: ApiRequestContext): Promise<JsonRecord> {
       const query = payload.query;
@@ -186,6 +200,10 @@ export async function createStoreExtension(store: Store, options: StoreOptions =
       const filter = object(payload.filter);
       const limit = integer(payload.limit, 10);
       const offset = integer(payload.offset, 0, Number.MAX_SAFE_INTEGER);
+      if (query && index && store.dialect === "postgres") {
+        return searchPgVectors(store, { prefix, filter, queryVector: (await embed(index, [query]))[0]!,
+          dims: index.dims, limit, offset, stamp: now() });
+      }
       const rows = query ? await store.rows<Row>(sql`SELECT i.*, e.source_hash AS embedding_hash,
           e.vectors AS embedding_vectors FROM valida_store_items i
           LEFT JOIN valida_store_embeddings e ON i.namespace = e.namespace AND i.item_key = e.item_key
