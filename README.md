@@ -31,6 +31,19 @@ console.log(result); // { count: 7, increment: 4 }
 
 `approval` pauses with an Agent Inbox approval request. Resume it with `command: { resume: { decisions: [{ type: "approve" }] } }` or click Approve/Reject in Agent Chat UI. The `echo` graph returns a deterministic reply to the last human message.
 
+The official `RemoteGraph` client works with the same API. Omit `thread_id` for a stateless run; pass it for persistent state, checkpoints, and history. A `RemoteGraph` can also be a node in another `StateGraph`.
+
+```ts
+import { RemoteGraph } from "@langchain/langgraph/remote";
+
+const remote = new RemoteGraph({ graphId: "counter", client });
+await remote.invoke({ count: 1, increment: 2 }); // stateless: count 3
+const remoteThread = await client.threads.create();
+const config = { configurable: { thread_id: remoteThread.thread_id } };
+await remote.invoke({ count: 3, increment: 2 }, config); // stateful: count 5
+const checkpoint = await remote.getState(config);
+```
+
 ## Connect the official Agent Chat UI
 
 Run the [official UI](https://github.com/langchain-ai/agent-chat-ui) in another directory:
@@ -72,10 +85,10 @@ Valida accepts TypeScript modules in `valida.json`:
 }
 ```
 
-An auth provider exports `authenticate(request)` and an optional `authorize({ user, resource, action, permissions }, value)`. It can verify a JWT, API key, or another credential and deny a resource operation. When authentication is enabled, new threads record an owner and thread reads/searches filter by that identity. A custom Hono app can be mounted with `http.app`; set `http.enable_custom_route_auth` if its routes need the same authentication. The example auth module uses `VALIDA_DEMO_TOKEN` and is disabled by default.
+An auth provider exports `authenticate(request)` and an optional `authorize({ user, resource, action, permissions, path, method, params, query }, value)`. It can verify a JWT, API key, or another credential, deny a resource operation, replace a write payload, or return a filter for reads/searches. Filters apply to threads, assistants, cron jobs, and store items. New threads record an owner and reads/searches also filter by that identity. A custom Hono app can be mounted with `http.app`; set `http.enable_custom_route_auth` if its routes need the same authentication. The example auth module uses `VALIDA_DEMO_TOKEN` and is disabled by default.
 
 ## Current compatibility
 
-Valida implements assistants, threads, runs, checkpoint state/history, SSE replay, HITL resume, exact-key namespaced JSON store, and cron scheduling. The HTTP v2 bridge supports state/lifecycle streams and HITL in the current SDK. Native token content-block streams, tool/subgraph streaming, semantic vector search, assistant versioning, and OpenTelemetry integrations from upstream Aegra are not implemented yet. The store returns 501 for semantic queries until a vector index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
+Valida implements assistants and version snapshots, graph schemas/topology, threads, runs, checkpoint state/history, SSE replay, HITL `resume`/`update`/`goto`, exact-key namespaced JSON store, and cron scheduling. Compiled graphs expose native v2 token content-block, tool, and subgraph events. The official LangGraph SDK, Agent Chat UI, and RemoteGraph are covered by deterministic integration tests. Semantic vector search, OpenTelemetry integrations, and AG-UI from upstream Aegra are still missing. The store returns 501 for semantic queries until a vector index is configured. See [src/api/README.md](./src/api/README.md) and [src/extensions/README.md](./src/extensions/README.md) for the precise endpoint behavior.
 
-Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime. Tests use SQLite and deterministic graphs; the distributed path has also been exercised with PostgreSQL, Redis, separate API and worker processes.
+Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime. With a server running, `bun run smoke` exercises the deployed API through the SDK and RemoteGraph. Set `VALIDA_API_URL` and `VALIDA_API_URL_2` to different API instances to verify cross-instance state and execution. Tests use SQLite and deterministic graphs; the distributed path has also been exercised with PostgreSQL, Redis, separate API and worker processes.

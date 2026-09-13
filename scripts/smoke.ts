@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Client } from "@langchain/langgraph-sdk";
+import { RemoteGraph } from "@langchain/langgraph/remote";
 
 const primaryUrl = process.env.VALIDA_API_URL ?? "http://127.0.0.1:2026";
 const secondaryUrl = process.env.VALIDA_API_URL_2 ?? primaryUrl;
@@ -51,7 +52,27 @@ assert.equal(approved.approved, true);
 assert.equal(approved.result, "Approved: smoke");
 assert.equal(record((await secondary.threads.getState(approval.thread_id)).values).result, "Approved: smoke");
 
+const remote = new RemoteGraph({ graphId: "counter", client: secondary });
+assert.equal(record(await remote.invoke({ count: 2, increment: 4 })).count, 6);
+const remoteThread = await primary.threads.create();
+const remoteConfig = { configurable: { thread_id: remoteThread.thread_id } };
+assert.equal(record(await remote.invoke({ count: 2, increment: 4 }, remoteConfig)).count, 6);
+assert.equal(record((await primary.threads.getState(remoteThread.thread_id)).values).count, 6);
+
+const v2 = secondary.threads.stream({ assistantId: "echo",
+  maxReconnectAttempts: 0, streamIdleReconnect: 0 });
+try {
+  await v2.run.start({ input: { messages: [{ role: "human", content: "v2 smoke" }] } });
+  const values = record(await v2.values);
+  const messages = values.messages;
+  assert.ok(Array.isArray(messages));
+  assert.equal(record(messages.at(-1)).content, "Echo: v2 smoke");
+} finally {
+  await v2.close();
+}
+
 console.log(JSON.stringify({
   status: "passed", primary: primaryUrl, secondary: secondaryUrl,
-  checks: ["assistants", "counter", "cross-instance state", "chat", "checkpoint history", "HITL resume"],
+  checks: ["assistants", "counter", "cross-instance state", "chat", "checkpoint history",
+    "HITL resume", "RemoteGraph stateless", "RemoteGraph stateful", "v2 stream"],
 }));
