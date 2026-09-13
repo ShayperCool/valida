@@ -77,6 +77,8 @@ test("SDK prune deletes only authorized idle threads and skips active runs", asy
     expect(await runtime.store.getThread(alice.thread_id)).toBeNull();
     expect(await runtime.store.getThread(bob.id)).not.toBeNull();
     expect(await runtime.store.getThread(busy.thread_id)).not.toBeNull();
+    expect(await client.threads.prune([bob.id], { strategy: "keep_latest" }))
+      .toMatchObject({ pruned_count: 0 });
     expect(await client.threads.prune([busy.thread_id], { strategy: "keep_latest" }))
       .toMatchObject({ pruned_count: 0 });
     await runtime.executeRun(run.run_id);
