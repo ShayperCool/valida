@@ -60,7 +60,7 @@ crons.start();
 pruner.start(ttlPolicy?.sweepIntervalMs);
 const port = Number(process.env.PORT ?? 2026);
 const hostname = process.env.HOST ?? "127.0.0.1";
-const server = Bun.serve({ port, hostname, fetch: app.fetch });
+const server = Bun.serve({ port, hostname, fetch: app.fetch, idleTimeout: Number(process.env.HTTP_IDLE_TIMEOUT ?? 10) });
 console.info(`Valida listening on http://${hostname}:${server.port} (${mode})`);
 const shutdown = async () => { server.stop(); crons.stop(); pruner.stop(); await runtime.close(); await telemetry?.shutdown(); };
 process.once("SIGINT", () => { void shutdown(); });
