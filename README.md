@@ -1,12 +1,12 @@
 # Valida
 
-Valida is a TypeScript server for running LangGraph graphs through the Agent Protocol. It targets Bun 1.4.1 and uses Drizzle for SQLite and PostgreSQL storage. The official [LangGraph SDK](https://github.com/langchain-ai/langgraph) and [Agent Chat UI](https://github.com/langchain-ai/agent-chat-ui) connect to its HTTP API.
+Valida is a TypeScript server for running LangGraph graphs through the Agent Protocol. It targets Bun 1.4.2 and uses Drizzle for SQLite and PostgreSQL storage. The official [LangGraph SDK](https://github.com/langchain-ai/langgraph) and [Agent Chat UI](https://github.com/langchain-ai/agent-chat-ui) connect to its HTTP API.
 
 This is a fresh TypeScript implementation inspired by [Aegra](https://github.com/aegra/aegra). It does not bundle a chat frontend. Graphs in this repository make no LLM calls, so tests run without API keys.
 
 ## Run locally
 
-Install [Bun 1.4.1](https://bun.sh/docs/installation), then:
+Install [Bun 1.4.2](https://bun.sh/docs/installation), then:
 
 ```bash
 bun install
@@ -107,6 +107,6 @@ Run `bun run typecheck` and `bun test` to verify the protocol and graph runtime.
 
 ## Releases
 
-The manual GitHub Actions release workflow tests Bun 1.4.1, builds a versioned source archive with `bun.lock`, verifies its SHA-256 checksum, and runs the SDK smoke test from an unpacked archive. It then publishes a Linux amd64/arm64 container image to GHCR and creates a GitHub Release tagged from `package.json` (for example, `v0.1.0`). The same image runs the API by default or a separate worker with `bun src/worker.ts`.
+The manual GitHub Actions release workflow tests Bun 1.4.2, builds a versioned source archive with `bun.lock`, verifies its SHA-256 checksum, and runs the SDK smoke test from an unpacked archive. It then publishes a Linux amd64/arm64 container image to GHCR and creates a GitHub Release tagged from `package.json` (for example, `v0.1.0`). The same image runs the API by default or a separate worker with `bun src/worker.ts`.
 
 To verify a release archive locally, run `bash scripts/build-release.sh` and `bash scripts/release-smoke.sh`. Releases do not publish to npm; install the archive with Bun or use the container image.
