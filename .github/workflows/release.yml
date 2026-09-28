@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test
@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.1
+          bun-version: 1.4.2
       - name: Build source release
         id: archive
         run: bash scripts/build-release.sh
