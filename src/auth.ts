@@ -162,14 +162,24 @@ function isRecord(value: unknown): value is AuthValue {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Route handlers parse JSON whatever the Content-Type says, so authorization must too. */
 async function jsonBody(request: Request): Promise<unknown> {
-  if (!request.headers.get("content-type")?.toLowerCase().includes("application/json")) return null;
+  if (request.body === null) return null;
   try {
     return await request.clone().json();
   } catch {
     // Let the route report malformed JSON using its normal error handling.
     return null;
   }
+}
+
+const protocolRoots = new Set(["assistants", "threads", "runs", "store", "ag-ui"]);
+const publicPaths = new Set(["/health", "/ready", "/live", "/info", "/openapi.json"]);
+
+/** Only these requests have a body that a route handler acts on. */
+function readsBody(method: string, path: string): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH" ||
+    (method === "DELETE" && path === "/store/items");
 }
 
 function isWrite(action: string): boolean {
@@ -180,11 +190,16 @@ export function authMiddleware(provider: AuthProvider | null, options: { protect
   return async (context, next) => {
     if (!provider) return next();
     const url = new URL(context.req.url);
-    const { pathname: path } = url;
-    if (["/health", "/ready", "/live", "/info", "/openapi.json"].includes(path)) return next();
-    const method = context.req.method.toUpperCase();
+    // Use the path Hono routes on. It percent-decodes the URL, so matching the raw
+    // pathname would let "/%74hreads" reach the threads routes unauthenticated.
+    const path = context.req.path;
+    if (publicPaths.has(path)) return next();
+    // Hono answers HEAD with the GET handler.
+    const method = context.req.method.toUpperCase() === "HEAD" ? "GET" : context.req.method.toUpperCase();
     const target = routeAuthTarget(method, path);
-    if (!target && !options.protectCustomRoutes) return next();
+    const root = path.split("/").find(Boolean) ?? "";
+    // Unmapped requests under a protocol root still authenticate.
+    if (!target && !options.protectCustomRoutes && !protocolRoots.has(root)) return next();
 
     let user: AuthUser;
     try {
@@ -199,7 +214,7 @@ export function authMiddleware(provider: AuthProvider | null, options: { protect
 
     const query = queryValue(url);
     const params = target?.params ?? {};
-    const parsedBody = await jsonBody(context.req.raw);
+    const parsedBody = readsBody(method, path) ? await jsonBody(context.req.raw) : null;
     const requestBody = isRecord(parsedBody) ? parsedBody : null;
     const batchBody = path === "/runs/batch" && Array.isArray(parsedBody) && parsedBody.every(isRecord)
       ? parsedBody as AuthValue[] : null;

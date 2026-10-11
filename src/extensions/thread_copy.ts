@@ -16,7 +16,7 @@ interface LegacyCheckpointRow {
 }
 
 /** Copy a finished thread's complete checkpoint lineage to a new thread. */
-export async function copyThread(store: Store, source: ThreadRecord): Promise<ThreadRecord> {
+export async function copyThread(store: Store, source: ThreadRecord, owner?: string): Promise<ThreadRecord> {
   if (source.status === "busy" || !await store.claimThread(source.id, [source.status])) {
     throw new ApiError(409, `Thread '${source.id}' is busy`);
   }
@@ -37,6 +37,7 @@ export async function copyThread(store: Store, source: ThreadRecord): Promise<Th
     // A copied thread is explicitly stateful even when its source was a
     // stateless run's temporary backing thread.
     delete metadata._ephemeral;
+    if (owner) metadata._owner = owner;
     const statements: SQL[] = [sql`INSERT INTO threads (id, metadata, status, created_at, updated_at)
       VALUES (${threadId}, ${JSON.stringify(metadata)}, ${source.status}, ${stamp}, ${stamp})`];
     for (const row of legacy) {

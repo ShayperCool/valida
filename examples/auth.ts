@@ -1,4 +1,7 @@
+import { createHash, timingSafeEqual } from "node:crypto";
 import type { AuthProvider } from "../src/auth.ts";
+
+const digest = (value: string) => createHash("sha256").update(value).digest();
 
 /** Example only. Set VALIDA_DEMO_TOKEN before enabling this in valida.json. */
 export const auth: AuthProvider = {
@@ -6,7 +9,7 @@ export const auth: AuthProvider = {
     const expected = process.env.VALIDA_DEMO_TOKEN;
     if (!expected) throw new Error("VALIDA_DEMO_TOKEN is not configured");
     const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
-    if (token !== expected) throw new Error("Invalid token");
+    if (!token || !timingSafeEqual(digest(token), digest(expected))) throw new Error("Invalid token");
     return { identity: "demo-user", is_authenticated: true, permissions: ["read", "write"] };
   },
   authorize(context) {

@@ -120,7 +120,9 @@ export async function createCronExtension(store: Store, runtime: GraphRuntime): 
       assistantId,
       input: payload.input,
       config: object(payload.config),
-      metadata: { ...object(payload.metadata), cron_id: String(row.cron_id) },
+      // `__` keys are runtime instructions and never come from a stored client payload.
+      metadata: { ...Object.fromEntries(Object.entries(object(payload.metadata)).filter(([key]) => !key.startsWith("__"))),
+        cron_id: String(row.cron_id) },
     });
   }
   function normalizePayload(value: JsonRecord, existing?: Row): { schedule: string; timezone: string; payload: JsonRecord; metadata: JsonRecord; enabled: boolean; endTime: string | null } {
