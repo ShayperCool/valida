@@ -19,31 +19,31 @@
   "dependencies": {
     "@ag-ui/core": "0.0.59",
     "@ag-ui/encoder": "0.0.59",
-    "@langchain/core": "^1.0.0",
-    "@langchain/langgraph": "^1.0.0",
-    "@langchain/langgraph-checkpoint": "^1.1.5",
-    "@langchain/langgraph-sdk": "^1.0.0",
+    "@langchain/core": "^1.2.17",
+    "@langchain/langgraph": "^1.4.21",
+    "@langchain/langgraph-checkpoint": "^1.1.6",
+    "@langchain/langgraph-sdk": "^1.12.3",
     "@langchain/protocol": "^0.0.19",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/exporter-trace-otlp-grpc": "^0.222.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.222.0",
     "@opentelemetry/exporter-trace-otlp-proto": "^0.222.0",
-    "@opentelemetry/resources": "^2.11.0",
-    "@opentelemetry/sdk-trace-base": "^2.11.0",
-    "@opentelemetry/sdk-trace-node": "^2.11.0",
-    "bullmq": "^5.0.0",
-    "cron-parser": "^5.10.1",
-    "drizzle-orm": "^0.44.0",
-    "hono": "^4.0.0",
-    "ioredis": "^5.0.0",
-    "postgres": "^3.0.0",
-    "zod": "^4.0.0"
+    "@opentelemetry/resources": "^2.12.0",
+    "@opentelemetry/sdk-trace-base": "^2.12.0",
+    "@opentelemetry/sdk-trace-node": "^2.12.0",
+    "bullmq": "^5.81.5",
+    "cron-parser": "^5.10.2",
+    "drizzle-orm": "^0.45.4",
+    "hono": "^4.13.13",
+    "ioredis": "^5.11.1",
+    "postgres": "^3.4.9",
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@ag-ui/client": "0.0.59",
     "@libsql/client": "^0.18.0",
     "@types/bun": "latest",
-    "drizzle-kit": "^0.31.0",
-    "typescript": "^5.0.0"
+    "drizzle-kit": "^0.31.11",
+    "typescript": "^5.9.3"
   }
 }
