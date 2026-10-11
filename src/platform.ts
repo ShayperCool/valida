@@ -498,7 +498,7 @@ export function createPlatformAdapter(
     },
     async health() { return { status: "healthy", database: store.dialect,
       queue: process.env.EXECUTION_MODE === "distributed" ? "bullmq" : "inline" }; },
-    async info() { return { name: "Valida", version: "0.1.0", status: "running",
+    async info() { return { name: "Valida", version: "0.1.1", status: "running",
       flags: { assistants: true, threads: true, runs: true, store: Boolean(extensions.store),
         crons: Boolean(extensions.crons), v2_event_streaming: true } }; },
   };

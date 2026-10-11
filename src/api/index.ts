@@ -188,7 +188,7 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
     json(
       (await adapter.info?.(ctx(c))) ?? {
         name: "Valida",
-        version: "0.1.0",
+        version: "0.1.1",
         description: "Self-hosted Agent Protocol server",
         status: "running",
         flags: { assistants: true, v2_event_streaming: true },

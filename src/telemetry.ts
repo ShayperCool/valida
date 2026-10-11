@@ -131,7 +131,7 @@ export class Telemetry {
         : new BatchSpanProcessor(exporter)),
     });
     if (options.registerGlobal !== false) this.provider.register();
-    this.tracer = this.provider.getTracer("valida", "0.1.0");
+    this.tracer = this.provider.getTracer("valida", "0.1.1");
   }
 
   /** Hono middleware. Register it before the API routes. */
