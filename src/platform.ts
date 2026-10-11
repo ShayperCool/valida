@@ -80,6 +80,15 @@ function ensureVisible(record: ThreadRecord | null): ThreadRecord | null {
   if (!visible(record)) throw new ApiError(403, "Thread access denied");
   return record;
 }
+/** Thread ownership is assigned by the server; a client-supplied `_owner` is ignored. */
+function clientMetadata(value: unknown): JsonRecord {
+  const { _owner: _ignored, ...metadata } = object(value);
+  return metadata;
+}
+/** `__`-prefixed run metadata carries runtime instructions such as resume commands. */
+function publicEntries(value: unknown): JsonRecord {
+  return Object.fromEntries(Object.entries(object(value)).filter(([key]) => !key.startsWith("__")));
+}
 function matchesMetadata(value: JsonRecord, filter: JsonRecord): boolean {
   return Object.entries(filter).every(([key, expected]) => value[key] === expected);
 }
@@ -154,6 +163,17 @@ export function createPlatformAdapter(
       async create(payload) {
         const graphId = String(payload.graph_id);
         if (!graphIds.includes(graphId)) throw new ApiError(422, `Unknown graph: ${graphId}`);
+        if (typeof payload.assistant_id === "string") {
+          const existing = await store.getAssistant(payload.assistant_id);
+          if (existing && payload.if_exists !== "do_nothing") {
+            throw new ApiError(409, `Assistant '${payload.assistant_id}' already exists`);
+          }
+          if (existing) {
+            if (!assistantVisible(existing)) throw new ApiError(403, "Assistant access denied");
+            const assistant = apiAssistant(existing);
+            return extensions.versions ? extensions.versions.decorate(assistant) : assistant;
+          }
+        }
         const created = await store.createAssistant({
           id: typeof payload.assistant_id === "string" ? payload.assistant_id : undefined,
           graphId, name: typeof payload.name === "string" ? payload.name : graphId,
@@ -234,8 +254,15 @@ export function createPlatformAdapter(
     },
     threads: {
       async create(payload) {
-        const metadata = object(payload.metadata);
+        const metadata = clientMetadata(payload.metadata);
         if (owner()) metadata._owner = owner();
+        if (typeof payload.thread_id === "string") {
+          const existing = await getThread(payload.thread_id);
+          if (existing && payload.if_exists !== "do_nothing") {
+            throw new ApiError(409, `Thread '${payload.thread_id}' already exists`);
+          }
+          if (existing) return threadWithValues(existing);
+        }
         const row = await store.createThread({
           id: typeof payload.thread_id === "string" ? payload.thread_id : undefined,
           metadata,
@@ -297,7 +324,7 @@ export function createPlatformAdapter(
         const row = await getThread(id);
         if (!row) return null;
         const updated = await store.updateThread(id, {
-          metadata: payload.metadata === undefined ? undefined : { ...row.metadata, ...object(payload.metadata) },
+          metadata: payload.metadata === undefined ? undefined : { ...row.metadata, ...clientMetadata(payload.metadata) },
           ttl: threadTtlForRequest(payload.ttl, ttlPolicy, "update"),
         });
         return updated ? threadWithValues(updated) : null;
@@ -366,7 +393,7 @@ export function createPlatformAdapter(
       async copy(id) {
         const original = await getThread(id);
         if (!original) return null;
-        return threadWithValues(await copyThread(store, original));
+        return threadWithValues(await copyThread(store, original, owner()));
       },
       async prune(payload) {
         const strategy = payload.strategy ?? "delete";
@@ -391,7 +418,7 @@ export function createPlatformAdapter(
           ...thread.metadata, graph_id: assistant.graphId, assistant_id: assistantId,
         } });
         const command = object(payload.command);
-        const metadata = { ...object(payload.metadata) };
+        const metadata = publicEntries(payload.metadata);
         const traceContext = runtime.captureTraceContext?.();
         if (traceContext?.traceparent) metadata.__trace_context = traceContext;
         const resumed = payload.command != null || (payload.input && object(payload.input).respond !== undefined);
@@ -401,7 +428,7 @@ export function createPlatformAdapter(
         const assistantConfig = object(assistant.config);
         const requestedConfig = object(payload.config);
         const config = { ...assistantConfig, ...requestedConfig,
-          configurable: { ...object(assistantConfig.configurable), ...object(requestedConfig.configurable) } };
+          configurable: { ...object(assistantConfig.configurable), ...publicEntries(requestedConfig.configurable) } };
         const runConfig = checkpointId
           ? { ...config, configurable: { ...object(config.configurable), checkpoint_id: checkpointId } }
           : config;

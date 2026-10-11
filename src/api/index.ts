@@ -460,9 +460,8 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   });
   app.delete("/store/items", async (c) => {
     if (!adapter.store) return error(501, "Store is not configured");
-    const payload = c.req.header("Content-Type")?.includes("application/json")
-      ? await body(c.req.raw)
-      : query(c.req.raw);
+    // Authorization inspects any JSON body, so the same body must select the item.
+    const payload = c.req.raw.body === null ? query(c.req.raw) : await body(c.req.raw);
     const namespace = Array.isArray(payload.namespace)
       ? payload.namespace
       : typeof payload.namespace === "string"
