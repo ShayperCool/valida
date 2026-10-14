@@ -38,7 +38,7 @@ const dropped = (runId: string) => sql`run_id = ${runId} AND (
   OR (event = 'v2' AND (
     ${field(["method"])} = 'tasks'
     OR (${field(["method"])} = 'messages' AND ${field(["params", "data", "event"])} = 'content-block-delta')
-    OR ${field(["method"])} = 'values'))`;
+    OR ${field(["method"])} = 'values')))`;
 
 let rows = 0, bytes = 0;
 for (const [index, runId] of runs.entries()) {
