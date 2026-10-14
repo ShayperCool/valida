@@ -2,7 +2,7 @@ import { Command, type ProtocolEvent } from "@langchain/langgraph";
 import { SpanStatusCode } from "@opentelemetry/api";
 import type { Telemetry, TraceCarrier } from "../telemetry.ts";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store } from "../db/index.js";
+import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObject, type RunRecord, type Store, type ThreadStatus } from "../db/index.js";
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
 import { V1TraceHandler } from "./v1_callbacks.js";
@@ -38,14 +38,28 @@ export interface RuntimeConfig {
   db: DatabaseConfig; queue?: QueueConfig; inline?: boolean; telemetry?: Telemetry | null;
   runTimeoutMs?: number; runLeaseMs?: number; recoveryPollMs?: number;
 }
+/**
+ * What a new run does when its thread already has an active run (LangGraph semantics):
+ * reject refuses it, enqueue runs it after the active ones, interrupt cancels them and keeps
+ * their progress, rollback cancels them and erases what they wrote.
+ */
+export type MultitaskStrategy = "reject" | "enqueue" | "interrupt" | "rollback";
+export const MULTITASK_STRATEGIES: readonly MultitaskStrategy[] = ["reject", "enqueue", "interrupt", "rollback"];
+export type CancelAction = "interrupt" | "rollback";
+/** The thread is taken by another run, or by a state edit, and the strategy does not allow waiting. */
+export class ThreadBusyError extends Error {
+  constructor(threadId: string) { super(`Thread ${threadId} is busy`); }
+}
 export interface StartRunOptions {
   threadId: string; graphId: string; assistantId?: string | null;
   input?: unknown; config?: JsonObject; metadata?: JsonObject;
+  multitaskStrategy?: MultitaskStrategy;
 }
 export interface ResumeRunOptions {
   threadId: string; resume: unknown; graphId?: string;
   assistantId?: string | null; config?: JsonObject; metadata?: JsonObject;
   update?: JsonObject; goto?: string | string[];
+  multitaskStrategy?: MultitaskStrategy;
 }
 export interface StreamOptions { after?: number; pollMs?: number; signal?: AbortSignal }
 export interface V2RecordedEvent { id: string; event: ProtocolEvent }
@@ -203,16 +217,42 @@ export class GraphRuntime {
     if (!await this.store.getThread(options.threadId)) await this.store.createThread({ id: options.threadId });
     const previous = await this.store.getState(options.threadId);
     const branchId = isObject(options.config?.configurable) ? options.config.configurable.checkpoint_id : undefined;
-    if (previous?.interrupts.length && !branchId) throw new Error(`Thread ${options.threadId} is interrupted; call resumeRun`);
+    const strategy = options.multitaskStrategy ?? "reject";
+    // A run queued behind an active one starts from whatever state that run leaves.
+    if (previous?.interrupts.length && !branchId && !(await this.store.listActiveRuns(options.threadId)).length) {
+      throw new Error(`Thread ${options.threadId} is interrupted; call resumeRun`);
+    }
     const allowed = branchId ? ["idle", "error", "interrupted"] as const : ["idle", "error"] as const;
-    if (!await this.store.claimThread(options.threadId, [...allowed])) throw new Error(`Thread ${options.threadId} is busy`);
+    const { multitaskStrategy: _, ...record } = options;
+    return this.admit(options.threadId, [...allowed], strategy, () => this.store.createRun(record));
+  }
+
+  /** Claim the thread for a new run, or apply the multitask strategy when it is taken. */
+  private async admit(threadId: string, allowed: ThreadStatus[], strategy: MultitaskStrategy,
+    create: () => Promise<RunRecord>): Promise<RunRecord> {
+    let claimed = await this.store.claimThread(threadId, allowed);
+    let active: RunRecord[] = [];
+    // The active run may end between the two reads; then the thread is simply free again.
+    for (let attempt = 0; !claimed && attempt < 3; attempt++) {
+      active = await this.store.listActiveRuns(threadId);
+      if (active.length) break;
+      claimed = await this.store.claimThread(threadId, allowed);
+    }
+    if (!claimed) {
+      if (!active.length || strategy === "reject") throw new ThreadBusyError(threadId);
+      if (strategy === "interrupt" || strategy === "rollback") {
+        for (const run of active) await this.cancelRun(run.id, strategy);
+        claimed = await this.store.claimThread(threadId, [...allowed, "interrupted"]);
+        if (!claimed) throw new ThreadBusyError(threadId);
+      }
+    }
     try {
-      const run = await this.store.createRun(options);
+      const run = await create();
       await this.store.appendEvent(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
       await this.dispatch(run.id);
       return run;
     } catch (error) {
-      await this.store.updateThread(options.threadId, { status: "error" });
+      if (claimed) await this.store.updateThread(threadId, { status: "error" });
       throw error;
     }
   }
@@ -222,21 +262,12 @@ export class GraphRuntime {
     if (!latest || !latest.interrupts.length) throw new Error(`Thread ${options.threadId} has no pending interrupt`);
     const graphId = options.graphId ?? latest.graphId;
     if (graphId !== latest.graphId) throw new Error(`Cannot resume ${latest.graphId} with graph ${graphId}`);
-    if (!await this.store.claimThread(options.threadId, ["interrupted"])) throw new Error(`Thread ${options.threadId} is busy`);
-    try {
-    const run = await this.store.createRun({
+    return this.admit(options.threadId, ["interrupted"], options.multitaskStrategy ?? "reject", () => this.store.createRun({
       threadId: options.threadId, graphId, assistantId: options.assistantId,
       input: null, resume: options.resume, config: options.config,
       metadata: { ...options.metadata, __resumeProvided: true,
         __commandUpdate: options.update, __commandGoto: options.goto },
-    });
-    await this.store.appendEvent(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
-    await this.dispatch(run.id);
-    return run;
-    } catch (error) {
-      await this.store.updateThread(options.threadId, { status: "error" });
-      throw error;
-    }
+    }));
   }
 
   private async dispatch(runId: string): Promise<void> {
@@ -292,6 +323,7 @@ export class GraphRuntime {
     if (this.active.has(runId)) return;
     this.active.add(runId);
     let releaseSlot: (() => void) | undefined;
+    let threadId: string | undefined;
     try {
       let recovering = false;
       for (;;) {
@@ -307,6 +339,8 @@ export class GraphRuntime {
         if (!current || completed.has(current.status)) return;
         recovering = current.status === "running";
         if (await this.store.claimRun(runId, this.runLeaseMs)) break;
+        // Queued behind another run of its thread: that run dispatches it when it ends.
+        if (current.status === "pending") return;
         // A stalled BullMQ job may be retried before its database lease expires.
         // Keep the replacement job alive until the owner finishes or the lease expires.
         releaseSlot();
@@ -316,6 +350,9 @@ export class GraphRuntime {
       }
       const run = await this.store.getRun(runId);
       if (!run) return;
+      // An enqueued run takes over a thread its predecessor has just released.
+      await this.store.updateThread(run.threadId, { status: "busy" });
+      threadId = run.threadId;
       const control: RunControl = { controller: new AbortController(), leaseUntil: run.leaseUntil! };
       this.controls.set(runId, control);
       const renew = () => {
@@ -381,13 +418,26 @@ export class GraphRuntime {
       this.controls.delete(runId);
       releaseSlot?.();
       this.active.delete(runId);
+      if (threadId) await this.dispatchNext(threadId).catch(() => {});
     }
+  }
+
+  /** Record how a run left its thread; a thread with queued runs stays busy, as in LangGraph. */
+  private async settleThread(threadId: string, status: ThreadStatus): Promise<void> {
+    const queued = (await this.store.listActiveRuns(threadId)).length > 0;
+    await this.store.updateThread(threadId, { status: queued ? "busy" : status });
+  }
+
+  /** Start the oldest run waiting on a thread once the thread's active run is over. */
+  private async dispatchNext(threadId: string): Promise<void> {
+    const [next] = await this.store.listActiveRuns(threadId);
+    if (next?.status === "pending" && !this.active.has(next.id)) await this.dispatch(next.id);
   }
 
   private async fail(run: RunRecord, error: unknown): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     if (!await this.finishRun(run, "error", undefined, message)) return;
-    await this.store.updateThread(run.threadId, { status: "error" });
+    await this.settleThread(run.threadId, "error");
     await this.store.appendEvent(run.id, "error", { message });
     await this.store.appendEvent(run.id, "end", { status: "error" });
   }
@@ -502,7 +552,7 @@ export class GraphRuntime {
       await this.store.appendEvent(run.id, "values", values);
     }
     if (!await this.finishRun(run, "success", values)) return;
-    await this.store.updateThread(run.threadId, { status: "idle" });
+    await this.settleThread(run.threadId, "idle");
     await this.store.appendEvent(run.id, "end", { status: "success", output: values });
   }
 
@@ -511,7 +561,7 @@ export class GraphRuntime {
     await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
       step, values, next, tasks: [{ name: next[0] }], interrupts: [{ value }], parentId });
     if (!await this.finishRun(run, "interrupted", values)) return;
-    await this.store.updateThread(run.threadId, { status: "interrupted" });
+    await this.settleThread(run.threadId, "interrupted");
     await this.store.appendEvent(run.id, "updates", { __interrupt__: [{ value }] });
     await this.store.appendEvent(run.id, "end", { status: "interrupted", output: values });
   }
@@ -610,7 +660,7 @@ export class GraphRuntime {
       }
     }
     if (!await this.finishRun(run, status, values)) return;
-    await this.store.updateThread(run.threadId, { status: status === "success" ? "idle" : "interrupted" });
+    await this.settleThread(run.threadId, status === "success" ? "idle" : "interrupted");
     await append("end", { status, output: values });
   }
 
@@ -657,7 +707,31 @@ export class GraphRuntime {
     }
   }
 
-  async cancelRun(runId: string): Promise<RunRecord | null> { return this.store.cancelRun(runId); }
+  /**
+   * Cancel a pending or running run and wait until a local execution has stopped. With
+   * rollback the run and everything it wrote are deleted, as if it had never been started.
+   */
+  async cancelRun(runId: string, action: CancelAction = "interrupt"): Promise<RunRecord | null> {
+    const before = await this.store.getRun(runId);
+    const cancelled = await this.store.cancelRun(runId);
+    if (!before || !cancelled) return null;
+    // Decided before aborting: a local execution may be gone by the time we look again.
+    const local = this.active.has(runId);
+    this.controls.get(runId)?.controller.abort(new Error("Run cancelled"));
+    await this.store.appendEvent(runId, "end", { status: "cancelled" });
+    if (local && before.status === "running") {
+      const deadline = Date.now() + Math.max(this.runLeaseMs, 1_000);
+      while (this.active.has(runId) && Date.now() < deadline) await sleep(20);
+    } else if (before.status === "running") {
+      // Another worker owns it and stops at its next lease check.
+      await sleep(Math.floor(this.runLeaseMs / 3) + 50);
+    }
+    if (action === "rollback") await this.store.deleteRun(runId);
+    const state = await this.store.getState(cancelled.threadId);
+    await this.settleThread(cancelled.threadId, state?.interrupts.length ? "interrupted" : "idle");
+    await this.dispatchNext(cancelled.threadId);
+    return cancelled;
+  }
   async waitRun(runId: string, pollMs = 50): Promise<RunRecord> {
     for (;;) {
       const run = await this.store.getRun(runId);

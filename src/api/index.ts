@@ -152,6 +152,8 @@ function runHeaders(threadId: string | null, runId: string): Record<string, stri
   return { Location: `${base}/stream`, "Content-Location": base };
 }
 
+const truthy = (value: string | undefined) => ["true", "yes", "1"].includes(String(value).toLowerCase());
+
 function notFound(kind: string, id: string): Response {
   return error(404, `${kind} '${id}' not found`);
 }
@@ -350,6 +352,12 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
     return adapter.runs.create(threadId, payload, requestContext);
   }
 
+  app.post("/runs/cancel", async (c) => {
+    if (!adapter.runs.cancelMany) return error(501, "Bulk run cancellation is not implemented");
+    const action = c.req.query("action") === "rollback" ? "rollback" : "interrupt";
+    const count = await adapter.runs.cancelMany(await body(c.req.raw), action, ctx(c));
+    return count ? new Response(null, { status: 204 }) : error(404, "No runs found to cancel.");
+  });
   app.post("/runs/batch", async (c) => {
     // The SDK's createBatch contract is stateless. Validate every item before
     // creating any run so malformed requests cannot start a partial batch.
@@ -410,9 +418,11 @@ export function createApi(adapter: PlatformAdapter): Hono<ApiEnv> {
   app.post("/threads/:threadId/runs/:runId/cancel", async (c) => {
     const { threadId, runId } = c.req.param();
     const action = c.req.query("action") === "rollback" ? "rollback" : "interrupt";
-    return (await adapter.runs.cancel(threadId, runId, action, ctx(c)))
-      ? new Response(null, { status: 204 })
-      : notFound("Run", runId);
+    if (!await adapter.runs.cancel(threadId, runId, action, ctx(c))) return error(404, "No runs found to cancel.");
+    // As in LangGraph: 202 right away, or with wait the run's final values once it has stopped.
+    if (!truthy(c.req.query("wait"))) return new Response(null, { status: 202 });
+    if (action === "rollback") return new Response(null, { status: 204 });
+    return json(await adapter.runs.join(threadId, runId, ctx(c)));
   });
   app.patch("/threads/:threadId/runs/:runId", async (c) => {
     const { threadId, runId } = c.req.param();

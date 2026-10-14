@@ -42,6 +42,10 @@ export interface EventRecord {
 type Raw = Record<string, unknown>;
 const now = () => new Date().toISOString();
 const encode = (value: unknown) => JSON.stringify(value ?? null);
+/** A run may execute only when no other run of its thread is running or was enqueued before it. */
+const headOfThread = sql`NOT EXISTS (SELECT 1 FROM runs AS other WHERE other.thread_id = runs.thread_id
+  AND other.id <> runs.id AND (other.status = ${"running"} OR (other.status = ${"pending"}
+  AND (other.created_at < runs.created_at OR (other.created_at = runs.created_at AND other.id < runs.id)))))`;
 const decode = <T>(value: unknown, fallback: T): T => {
   if (value == null) return fallback;
   try { return JSON.parse(String(value)) as T; } catch { return fallback; }
@@ -227,8 +231,11 @@ export class Store {
   }
   async claimThread(id: string, expected: ThreadStatus[]): Promise<boolean> {
     if (!expected.length) return false;
+    // A thread with a pending (enqueued) or running run is never free, whatever its status says.
     const rows = await this.rows<{ id: string }>(sql`UPDATE threads SET status = ${"busy"}, updated_at = ${now()}
-      WHERE id = ${id} AND status IN (${sql.join(expected.map(value => sql`${value}`), sql`, `)}) RETURNING id`);
+      WHERE id = ${id} AND status IN (${sql.join(expected.map(value => sql`${value}`), sql`, `)})
+      AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.thread_id = ${id} AND runs.status IN (${"pending"}, ${"running"}))
+      RETURNING id`);
     return rows.length === 1;
   }
   async deleteThread(id: string): Promise<void> {
@@ -267,12 +274,20 @@ export class Store {
       : sql``;
     return (await this.rows(sql`SELECT * FROM runs WHERE ${graphFilter}(status = ${"pending"}
       OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp})))
+      AND ${headOfThread}
       ORDER BY created_at ASC LIMIT ${limit}`)).map(run);
+  }
+  /** Pending and running runs, oldest first; of one thread when it is given. */
+  async listActiveRuns(threadId?: string): Promise<RunRecord[]> {
+    const thread = threadId === undefined ? sql`` : sql`thread_id = ${threadId} AND `;
+    return (await this.rows(sql`SELECT * FROM runs WHERE ${thread}status IN (${"pending"}, ${"running"})
+      ORDER BY created_at ASC, id ASC`)).map(run);
   }
   async claimRun(id: string, leaseMs = 60_000): Promise<boolean> {
     const until = new Date(Date.now() + leaseMs).toISOString(), stamp = now();
     const claimed = await this.rows<{ id: string }>(sql`UPDATE runs SET status = ${"running"}, lease_until = ${until}, updated_at = ${stamp}
       WHERE id = ${id} AND (status = ${"pending"} OR (status = ${"running"} AND (lease_until IS NULL OR lease_until < ${stamp})))
+      AND ${headOfThread}
       RETURNING id`);
     return claimed.length === 1;
   }
@@ -301,6 +316,24 @@ export class Store {
       lease_until = ${patch.leaseUntil === undefined ? old.leaseUntil : patch.leaseUntil}, metadata = ${encode(patch.metadata ?? old.metadata)},
       updated_at = ${now()} WHERE id = ${id}`);
     return this.getRun(id);
+  }
+  /** Remove a rolled-back run with everything it wrote: events, checkpoints and native LangGraph state. */
+  async deleteRun(id: string): Promise<void> {
+    const target = await this.getRun(id);
+    if (!target) return;
+    // Runs of a thread execute one at a time, so native checkpoints written since it began executing are its own.
+    const [started] = await this.rows<{ at: string | null }>(sql`SELECT MIN(created_at) AS at FROM events
+      WHERE run_id = ${id} AND event = ${"run"}`);
+    await this.transaction([
+      ...(started?.at ? [
+        sql`DELETE FROM lg_writes WHERE thread_id = ${target.threadId} AND checkpoint_id IN
+          (SELECT checkpoint_id FROM lg_checkpoints WHERE thread_id = ${target.threadId} AND created_at >= ${started.at})`,
+        sql`DELETE FROM lg_checkpoints WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
+      ] : []),
+      sql`DELETE FROM checkpoints WHERE run_id = ${id}`,
+      sql`DELETE FROM events WHERE run_id = ${id}`,
+      sql`DELETE FROM runs WHERE id = ${id}`,
+    ]);
   }
   async cancelRun(id: string): Promise<RunRecord | null> {
     const rows = await this.rows<Raw>(sql`UPDATE runs SET status = ${"cancelled"},

@@ -301,7 +301,8 @@ export function createAgUiApi(adapter: PlatformAdapter, runtime: NativeV2Runtime
         messages: newMessages(input, previous) } }),
       config: { ...forwardedConfig, configurable: { ...object(forwardedConfig.configurable),
         ag_ui_tools: input.tools, ag_ui_context: input.context } },
-      metadata: object(forwarded.metadata) };
+      metadata: object(forwarded.metadata),
+      multitask_strategy: forwarded.multitask_strategy ?? forwarded.multitaskStrategy };
     const run = await adapter.runs.create(thread.thread_id, payload, context);
     const encoder = new EventEncoder({ accept: c.req.header("accept") });
     const stream = new ReadableStream<Uint8Array>({
