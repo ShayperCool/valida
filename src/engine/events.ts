@@ -96,14 +96,6 @@ export class RunEventLog {
     return record;
   }
 
-  /** Persist an event that was first recorded as live only, e.g. a run's final state. */
-  keep(runId: string, record: RunEvent): void {
-    const log = this.logs.get(runId);
-    if (!log || log.done || log.pending.includes(record)) return;
-    log.pending.push(record);
-    log.flushTimer ??= setTimeout(() => { void this.flush(runId); }, this.flushMs);
-  }
-
   /** Write queued durable events in one transaction. */
   async flush(runId: string): Promise<void> {
     const log = this.logs.get(runId);

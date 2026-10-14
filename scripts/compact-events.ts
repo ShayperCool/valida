@@ -5,8 +5,8 @@
  * every step (values), task inputs, LangChain callback traces and a legacy duplicate of most
  * envelopes. Runs now keep only what replay needs unless a client asked for those stream modes
  * (see durableV2 in src/engine/index.ts). For finished runs of compiled graphs that recorded no
- * stream modes, this keeps lifecycle, updates, tools, custom events, checkpoint markers, finished
- * messages and the final root values, and clears the copy of the final state on the run row.
+ * stream modes, this keeps lifecycle, updates, tools, custom events, checkpoint markers and finished
+ * messages, and clears the copies of the final state on the run row and its run-level checkpoint.
  *
  *   bun scripts/compact-events.ts <sqlite path or postgres url> [--dry-run]
  *
@@ -24,9 +24,6 @@ const pg = store.dialect === "postgres";
 const field = (path: string[]) => pg
   ? sql.raw(`(data::jsonb #>> '{${path.join(",")}}')`)
   : sql.raw(`json_extract(data, '$.${path.join(".")}')`);
-const namespaceLength = pg
-  ? sql.raw(`jsonb_array_length(data::jsonb #> '{params,namespace}')`)
-  : sql.raw(`json_array_length(data, '$.params.namespace')`);
 
 // Finished runs of compiled graphs (they recorded v3 envelopes) without requested stream modes.
 const runs = (await store.rows<{ id: string; metadata: string }>(sql`SELECT id, metadata FROM runs
@@ -41,10 +38,7 @@ const dropped = (runId: string) => sql`run_id = ${runId} AND (
   OR (event = 'v2' AND (
     ${field(["method"])} = 'tasks'
     OR (${field(["method"])} = 'messages' AND ${field(["params", "data", "event"])} = 'content-block-delta')
-    OR (${field(["method"])} = 'values' AND (${namespaceLength} > 0 OR seq <> (
-      SELECT MAX(last.seq) FROM events AS last WHERE last.run_id = ${runId} AND last.event = 'v2'
-        AND ${sql.raw(pg ? `(last.data::jsonb #>> '{method}')` : `json_extract(last.data, '$.method')`)} = 'values'
-        AND ${sql.raw(pg ? `jsonb_array_length(last.data::jsonb #> '{params,namespace}')` : `json_array_length(last.data, '$.params.namespace')`)} = 0))))))`;
+    OR ${field(["method"])} = 'values'))`;
 
 let rows = 0, bytes = 0;
 for (const [index, runId] of runs.entries()) {
@@ -57,6 +51,7 @@ for (const [index, runId] of runs.entries()) {
       sql`DELETE FROM events WHERE ${dropped(runId)}`,
       // The final state is the thread state; the run row and end event no longer copy it.
       sql`UPDATE runs SET output = NULL WHERE id = ${runId}`,
+      sql`UPDATE checkpoints SET state_values = '{}' WHERE run_id = ${runId}`,
       pg ? sql`UPDATE events SET data = (data::jsonb - 'output')::text WHERE run_id = ${runId} AND event = 'end'`
         : sql`UPDATE events SET data = json_remove(data, '$.output') WHERE run_id = ${runId} AND event = 'end'`,
     ]);

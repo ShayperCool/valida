@@ -6,7 +6,7 @@ import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObjec
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
 import { V1TraceHandler } from "./v1_callbacks.js";
-import { RunEventLog, type RunEvent } from "./events.js";
+import { RunEventLog } from "./events.js";
 import { migrateLegacyCheckpoints } from "./legacy_checkpoints.js";
 import { toWire } from "./wire.js";
 export { toWire } from "./wire.js";
@@ -168,7 +168,12 @@ export class GraphRuntime {
 
   createThread(value: { id?: string; metadata?: JsonObject } = {}) { return this.store.createThread(value); }
   getThread(id: string) { return this.store.getThread(id); }
-  getState(threadId: string) { return this.store.getState(threadId); }
+  /** The thread's latest record; for compiled graphs its values come from the native checkpoint. */
+  async getState(threadId: string): Promise<CheckpointRecord | null> {
+    const row = await this.store.getState(threadId);
+    if (!row || this.graphs.get(row.graphId)?.kind !== "compiled") return row;
+    return { ...row, values: (await this.getGraphState(threadId, undefined, row.graphId))?.values ?? row.values };
+  }
   getHistory(threadId: string, limit?: number) { return this.store.getHistory(threadId, limit); }
   getRun(runId: string) { return this.store.getRun(runId); }
   getRuns(threadId: string, limit?: number) { return this.store.listRuns(threadId, limit); }
@@ -616,7 +621,6 @@ export class GraphRuntime {
       writeTail = pending.catch(() => undefined);
       return pending;
     };
-    let finalValues: RunEvent | null = null;
     const modes = new Set(Array.isArray(run.metadata.__stream_modes)
       ? run.metadata.__stream_modes.filter((mode): mode is string => typeof mode === "string") : []);
     if (graph.streamEvents) {
@@ -636,14 +640,11 @@ export class GraphRuntime {
           terminalV2 = wire;
           continue;
         }
-        const recorded = await append("v2", wire, durableV2(wire, modes));
-        if (wire.method === "values" && wire.params.namespace.length === 0) finalValues = recorded as RunEvent | null;
+        await append("v2", wire, durableV2(wire, modes));
         if (wire.method === "updates" && wire.params.namespace.length === 0 && isObject(wire.params.data) &&
           isObject(wire.params.data.values) && "__interrupt__" in wire.params.data.values) sawInterruptUpdate = true;
       }
-      // Of the per-step full states, only the run's final one is kept for replay; the thread state has the rest.
       await writeTail;
-      if (finalValues) this.events.keep(run.id, finalValues);
     } else {
       for await (const chunk of await graph.stream(input, config)) {
         await this.ensureActive(run.id);
@@ -656,14 +657,14 @@ export class GraphRuntime {
     const latestConfigurable: JsonObject = { ...configurable };
     delete latestConfigurable.checkpoint_id;
     const snapshot = await graph.getState({ ...config, configurable: latestConfigurable });
-    const values = stateOf(toWire(snapshot.values));
     const next = Array.isArray(snapshot.next) ? snapshot.next.map(String) : [];
     const tasks = Array.isArray(snapshot.tasks) ? toWire(snapshot.tasks) as unknown[] : [];
     const interrupts = tasks.flatMap((task: unknown) => isObject(task) && Array.isArray(task.interrupts) ? task.interrupts : []);
     const previous = await this.store.getState(run.threadId);
     await this.ensureActive(run.id);
+    // The state itself lives in the native checkpoints; this row only tracks the run's outcome.
     await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: run.graphId,
-      step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
+      step: (previous?.step ?? 0) + 1, values: {}, next, tasks, interrupts,
       parentId: previous?.id ?? null });
     const status = interrupts.length || next.length ? "interrupted" : "success";
     if (interrupts.length && !sawInterruptUpdate && !graph.streamEvents) await append("updates", { __interrupt__: interrupts });
@@ -712,7 +713,7 @@ export class GraphRuntime {
           ...(nativeCheckpointId ? { checkpoint_id: nativeCheckpointId } : {}) } });
         const snapshot = this.snapshot(raw);
         const row = await this.store.createCheckpoint({ threadId, runId: previous.runId,
-          graphId: previous.graphId, step: previous.step + 1, values: snapshot.values,
+          graphId: previous.graphId, step: previous.step + 1, values: {},
           next: snapshot.next, tasks: snapshot.tasks, interrupts: snapshot.interrupts,
           parentId: checkpointId ? null : previous.id });
         await this.store.updateThread(threadId, { status: snapshot.interrupts.length || snapshot.next.length

@@ -151,7 +151,7 @@ export function createPlatformAdapter(
     }
     const checkpoint = snapshot?.config ?? (state
       ? { thread_id: row.id, checkpoint_id: state.id, checkpoint_ns: "" } : null);
-    return { ...apiThread(row), values: state?.values ?? {},
+    return { ...apiThread(row), values: snapshot?.values ?? state?.values ?? {},
       state_updated_at: state?.createdAt ?? row.createdAt,
       config: checkpoint ? { configurable: checkpoint } : {}, interrupts };
   }
@@ -318,7 +318,11 @@ export function createPlatformAdapter(
         let candidates = needsState
           ? await Promise.all(filtered.map(async row => ({ row, state: await store.getState(row.id) })))
           : filtered.map(row => ({ row, state: undefined as CheckpointRecord | null | undefined }));
-        if (values !== null) candidates = candidates.filter(({ state }) => matchesValues(state?.values ?? {}, values));
+        if (values !== null) {
+          const matched = await Promise.all(candidates.map(async candidate => matchesValues(
+            (await runtime.getGraphState?.(candidate.row.id))?.values ?? candidate.state?.values ?? {}, values)));
+          candidates = candidates.filter((_, index) => matched[index]);
+        }
         const sortValue = ({ row, state }: (typeof candidates)[number]): string => {
           switch (sortBy) {
             case "thread_id": return row.id;
@@ -493,7 +497,8 @@ export function createPlatformAdapter(
           if (!run) throw new ApiError(404, `Run '${runId}' not found`);
           if (["success", "interrupted", "error", "cancelled"].includes(run.status)) {
             if (run.status === "error") throw new ApiError(500, run.error ?? "Run failed");
-            return run.output ?? (await store.getState(run.threadId))?.values ?? {};
+            return run.output ?? (await runtime.getGraphState?.(run.threadId))?.values
+              ?? (await store.getState(run.threadId))?.values ?? {};
           }
           await Bun.sleep(50);
         }

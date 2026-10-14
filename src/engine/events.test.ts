@@ -31,11 +31,14 @@ test("a run that asked for no replay modes streams everything live but stores on
   const stored = (await runtime.store.listEvents(run.id, 0, 1000)).map(method);
   expect(stored).not.toContain("messages:content-block-delta");
   expect(stored).not.toContain("tasks:");
-  // Only the final state is kept, once; the thread state is the record of every step.
-  expect(stored.filter(name => name === "values:")).toHaveLength(1);
+  // The thread state is the record of every step; full states are not copied into events.
+  expect(stored).not.toContain("values:");
   expect(stored).toContain("messages:message-finish");
   expect(stored.at(-1)).toBe("end");
   expect((await runtime.getRun(run.id))?.output).toBeNull();
+  // Nor is it copied into the run's bookkeeping row; readers get it from the native checkpoint.
+  expect((await runtime.store.getState(thread.id))?.values).toEqual({});
+  expect(((await runtime.getState(thread.id))?.values.messages as unknown[])).toHaveLength(2);
 });
 
 test("a run created for the values and messages modes keeps them for replay", async () => {
