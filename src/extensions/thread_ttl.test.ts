@@ -56,8 +56,8 @@ test("keep_latest compacts once across concurrent sweepers and re-arms TTL", asy
     const ttl = (await runtime.store.getThreadTtl(thread.id))!;
     expect(new Date(ttl.expiresAt).getTime() - now).toBe(5 * 60_000);
     expect(await new ThreadPruner(runtime.store).sweepExpired(now)).toEqual({ deleted: 0, pruned: 0 });
-    expect((await runtime.waitRun((await runtime.startRun({ threadId: thread.id, graphId: "counter",
-      input: {} })).id)).output).toMatchObject({ count: 4 });
+    await runtime.waitRun((await runtime.startRun({ threadId: thread.id, graphId: "counter", input: {} })).id);
+    expect((await runtime.getState(thread.id))?.values).toMatchObject({ count: 4 });
   } finally {
     await runtime.close();
   }

@@ -106,7 +106,13 @@ export class Store {
       this.sqlite = new Database(config.url ?? ":memory:", { create: true });
       this.sqlite.exec("PRAGMA foreign_keys = ON");
       this.sqlite.exec("PRAGMA busy_timeout = 5000");
-      if (config.url && config.url !== ":memory:") this.sqlite.exec("PRAGMA journal_mode = WAL");
+      if (config.url && config.url !== ":memory:") {
+        this.sqlite.exec("PRAGMA journal_mode = WAL");
+        // With WAL, NORMAL cannot corrupt the database and syncs only at checkpoints, not on every
+        // commit; an OS crash may lose the latest commits. FULL made each event insert an fsync,
+        // which blocked the whole server on disk during long streaming runs.
+        this.sqlite.exec("PRAGMA synchronous = NORMAL");
+      }
       this.sqliteDb = sqliteDrizzle(this.sqlite);
     } else {
       this.pg = postgres(config.url, { max: 10 });
@@ -369,6 +375,20 @@ export class Store {
       if (rows[0]) return { runId, seq: Number(rows[0].seq), event: name, data, createdAt: stamp };
     }
     throw new Error(`Could not append event for run ${runId} after concurrent writes`);
+  }
+  async maxEventSeq(runId: string): Promise<number> {
+    const [row] = await this.rows<{ seq: number | null }>(sql`SELECT MAX(seq) AS seq FROM events WHERE run_id = ${runId}`);
+    return Number(row?.seq ?? 0);
+  }
+  /** Store events whose sequence numbers the run's executor already assigned. */
+  async insertEvents(runId: string, items: readonly { seq: number; event: string; data: unknown; at?: string }[]): Promise<void> {
+    if (!items.length) return;
+    // An event appended concurrently by another process keeps its slot; this one is dropped.
+    const rows = items.map(item => sql`(${runId}, ${item.seq}, ${item.event}, ${encode(item.data)}, ${item.at ?? now()})`);
+    for (let i = 0; i < rows.length; i += 200) {
+      await this.exec(sql`INSERT INTO events (run_id, seq, event, data, created_at)
+        VALUES ${sql.join(rows.slice(i, i + 200), sql`, `)} ON CONFLICT (run_id, seq) DO NOTHING`);
+    }
   }
   async listEvents(runId: string, after = 0, limit = 100): Promise<EventRecord[]> {
     return (await this.rows(sql`SELECT * FROM events WHERE run_id = ${runId} AND seq > ${after} ORDER BY seq ASC LIMIT ${limit}`)).map(event);

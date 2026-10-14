@@ -9,6 +9,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRuntime, type GraphRuntime } from "./index.js";
+import type { ProtocolEvent } from "@langchain/langgraph";
 
 const open: GraphRuntime[] = [];
 const dirs: string[] = [];
@@ -98,7 +99,9 @@ test("compiled graph exposes Agent Protocol messages in events and saved state",
   expect(messages.every(message => typeof message.id === "string")).toBe(true);
   expect(messages.every(message => !('lc' in message))).toBe(true);
   expect(messages.every(message => Object.keys(message).every(key => !key.startsWith("lc_")))).toBe(true);
-  const events = await runtime.store.listEvents(run.id);
+  // Compiled graphs store v3 envelopes; the legacy view is derived from them.
+  const events = [];
+  for await (const item of runtime.stream(run.id)) events.push(item);
   const valueEvent = events.find(event => event.event === "values" &&
     Array.isArray((event.data as Record<string, unknown>)?.messages) &&
     ((event.data as { messages: unknown[] }).messages).length === 2);
@@ -201,11 +204,16 @@ test("v2 stream persists native content-block token events without a remote mode
   expect(events.some(event => event.method === "lifecycle" &&
     (event.params.data as { event?: string }).event === "completed")).toBe(true);
   expect(events.some(event => event.method === "checkpoints")).toBe(true);
-  const legacy = await runtime.store.listEvents(run.id);
-  expect(legacy.some(event => event.event === "values")).toBe(true);
   const legacyStream = [];
   for await (const item of runtime.stream(run.id)) legacyStream.push(item.event);
+  expect(legacyStream).toContain("values");
   expect(legacyStream).not.toContain("v2");
+  // Token deltas are streamed live but not stored; the stored record keeps the finished message.
+  const stored = await runtime.store.listEvents(run.id, 0, 1000);
+  expect(stored.some(item => item.event === "v2" && (item.data as ProtocolEvent).method === "messages" &&
+    ((item.data as ProtocolEvent).params.data as { event?: string }).event === "content-block-delta")).toBe(false);
+  expect(stored.some(item => item.event === "v2" && (item.data as ProtocolEvent).method === "messages" &&
+    ((item.data as ProtocolEvent).params.data as { event?: string }).event === "message-finish")).toBe(true);
   expect(((await runtime.getState(thread.id))?.values.messages as Array<{ content: Array<{ type: string; text: string }> }>).at(-1)?.content)
     .toEqual([{ type: "text", text: "Hello" }]);
 });

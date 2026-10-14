@@ -60,8 +60,11 @@ test("SDK createBatch starts ordered stateless runs and authorizes every item", 
     expect(runs).toHaveLength(2);
     expect(new Set(runs.map(run => run.thread_id)).size).toBe(2);
     expect(authorizedInputs).toEqual([1, -1, 1, 5]);
-    expect((await runtime.waitRun(runs[0]!.run_id)).output).toMatchObject({ count: 2 });
-    expect((await runtime.waitRun(runs[1]!.run_id)).output).toMatchObject({ count: 51 });
+    // As on LangGraph's server, a compiled graph's result is its thread state, not a copy on the run.
+    await runtime.waitRun(runs[0]!.run_id);
+    await runtime.waitRun(runs[1]!.run_id);
+    expect((await runtime.getState(runs[0]!.thread_id))?.values).toMatchObject({ count: 2 });
+    expect((await runtime.getState(runs[1]!.thread_id))?.values).toMatchObject({ count: 51 });
     expect((await runtime.store.getThread(runs[0]!.thread_id))?.metadata._owner).toBe("alice");
 
     const invalid = await app.request("/runs/batch", {

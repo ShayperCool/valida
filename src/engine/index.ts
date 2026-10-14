@@ -6,6 +6,7 @@ import { createStore, type CheckpointRecord, type DatabaseConfig, type JsonObjec
 import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
 import { V1TraceHandler } from "./v1_callbacks.js";
+import { RunEventLog, type RunEvent } from "./events.js";
 import { toWire } from "./wire.js";
 export { toWire } from "./wire.js";
 
@@ -78,6 +79,21 @@ const stateOf = (value: unknown): State => isObject(value) ? value : value == nu
 const ends = (node: string) => node === "END" || node === "__end__";
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const completed = new Set(["success", "error", "interrupted", "cancelled"]);
+/**
+ * Which v3 protocol envelopes are stored for replay. Like LangGraph's server, which only keeps
+ * the stream modes a run was created with, per-step full states (values), task inputs (tasks)
+ * and token deltas are kept only when a client asked for a mode built from them; otherwise
+ * they are streamed live and the thread state remains the record.
+ */
+function durableV2(event: ProtocolEvent, modes: ReadonlySet<string>): boolean {
+  const has = (...names: string[]) => names.some(name => modes.has(name));
+  if (event.method === "values") return has("values", "debug", "events");
+  if (event.method === "tasks") return has("tasks", "debug");
+  if (event.method === "messages" && isObject(event.params.data) && event.params.data.event === "content-block-delta") {
+    return has("messages", "messages-tuple");
+  }
+  return true;
+}
 type RunControl = {
   controller: AbortController; leaseUntil: string;
   heartbeat?: Promise<void>; heartbeatTimer?: ReturnType<typeof setInterval>;
@@ -87,6 +103,7 @@ type RunControl = {
 export class GraphRuntime {
   readonly store: Store;
   readonly checkpointer: DrizzleCheckpointer;
+  readonly events: RunEventLog;
   private readonly queue?: RunQueue;
   private readonly inline: boolean;
   private readonly active = new Set<string>();
@@ -106,6 +123,7 @@ export class GraphRuntime {
     this.store = store;
     this.telemetry = config.telemetry;
     this.checkpointer = new DrizzleCheckpointer(store);
+    this.events = new RunEventLog(store);
     this.maxConcurrentRuns = config.queue ? config.queue.concurrency ?? 4 : Infinity;
     if (config.queue && (!Number.isInteger(this.maxConcurrentRuns) || this.maxConcurrentRuns < 1)) {
       throw new Error("queue.concurrency must be a positive integer");
@@ -248,7 +266,7 @@ export class GraphRuntime {
     }
     try {
       const run = await create();
-      await this.store.appendEvent(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
+      await this.events.append(run.id, "metadata", { run_id: run.id, thread_id: run.threadId });
       await this.dispatch(run.id);
       return run;
     } catch (error) {
@@ -353,6 +371,7 @@ export class GraphRuntime {
       // An enqueued run takes over a thread its predecessor has just released.
       await this.store.updateThread(run.threadId, { status: "busy" });
       threadId = run.threadId;
+      await this.events.open(runId);
       const control: RunControl = { controller: new AbortController(), leaseUntil: run.leaseUntil! };
       this.controls.set(runId, control);
       const renew = () => {
@@ -379,7 +398,7 @@ export class GraphRuntime {
         return;
       }
       const execute = async () => {
-        await this.store.appendEvent(run.id, "run", { status: "running", recovering });
+        await this.events.append(run.id, "run", { status: "running", recovering });
         try {
           const interrupted = new Promise<never>((_, reject) => {
             control.controller.signal.addEventListener("abort", () => reject(control.controller.signal.reason), { once: true });
@@ -417,6 +436,8 @@ export class GraphRuntime {
       await control?.heartbeat;
       this.controls.delete(runId);
       releaseSlot?.();
+      if (threadId) await this.events.close(runId).catch(error =>
+        console.warn(`Could not persist events of run ${runId}: ${String(error)} ${String((error as { cause?: unknown })?.cause ?? "")}`));
       this.active.delete(runId);
       if (threadId) await this.dispatchNext(threadId).catch(() => {});
     }
@@ -438,8 +459,8 @@ export class GraphRuntime {
     const message = error instanceof Error ? error.message : String(error);
     if (!await this.finishRun(run, "error", undefined, message)) return;
     await this.settleThread(run.threadId, "error");
-    await this.store.appendEvent(run.id, "error", { message });
-    await this.store.appendEvent(run.id, "end", { status: "error" });
+    await this.events.append(run.id, "error", { message });
+    await this.events.append(run.id, "end", { status: "error" });
   }
 
   private async ensureActive(runId: string): Promise<void> {
@@ -501,7 +522,7 @@ export class GraphRuntime {
       const updated = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id,
         graphId: graph.id, step, values, next, tasks: [], interrupts: [], parentId });
       parentId = updated.id;
-      await this.store.appendEvent(run.id, "values", values);
+      await this.events.append(run.id, "values", values);
     }
     if (!previous || (!resuming && !continuing)) {
       step++;
@@ -509,7 +530,7 @@ export class GraphRuntime {
       const initial = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
         step, values, next, tasks: [], interrupts: [], parentId });
       parentId = initial.id;
-      await this.store.appendEvent(run.id, "values", values);
+      await this.events.append(run.id, "values", values);
     }
     const limit = graph.recursionLimit ?? 100;
     let localSteps = 0;
@@ -548,12 +569,12 @@ export class GraphRuntime {
       const saved = await this.store.createCheckpoint({ threadId: run.threadId, runId: run.id, graphId: graph.id,
         step, values, next, tasks: [], interrupts: [], parentId });
       parentId = saved.id;
-      await this.store.appendEvent(run.id, "updates", { [current]: update });
-      await this.store.appendEvent(run.id, "values", values);
+      await this.events.append(run.id, "updates", { [current]: update });
+      await this.events.append(run.id, "values", values);
     }
     if (!await this.finishRun(run, "success", values)) return;
     await this.settleThread(run.threadId, "idle");
-    await this.store.appendEvent(run.id, "end", { status: "success", output: values });
+    await this.events.append(run.id, "end", { status: "success", output: values });
   }
 
   private async interruptCustom(run: RunRecord, graph: GraphDefinition, values: State, next: string[], step: number, parentId: string | null, value: unknown): Promise<void> {
@@ -562,8 +583,8 @@ export class GraphRuntime {
       step, values, next, tasks: [{ name: next[0] }], interrupts: [{ value }], parentId });
     if (!await this.finishRun(run, "interrupted", values)) return;
     await this.settleThread(run.threadId, "interrupted");
-    await this.store.appendEvent(run.id, "updates", { __interrupt__: [{ value }] });
-    await this.store.appendEvent(run.id, "end", { status: "interrupted", output: values });
+    await this.events.append(run.id, "updates", { __interrupt__: [{ value }] });
+    await this.events.append(run.id, "end", { status: "interrupted", output: values });
   }
 
   private async executeCompiled(run: RunRecord, graph: CompiledGraphLike, recovering: boolean): Promise<void> {
@@ -582,16 +603,20 @@ export class GraphRuntime {
     let sawInterruptUpdate = false;
     const requestedIds = new Set<string>();
     // Native stream callbacks and the protocol iterator can emit concurrently.
-    // Serialize writes so each event gets a unique, replayable database sequence.
+    // Serialize appends so each event gets a unique, replayable sequence number.
     let writeTail: Promise<unknown> = Promise.resolve();
-    const append = (name: string, data: unknown) => {
-      const pending = writeTail.then(() => this.store.appendEvent(run.id, name, data));
+    const append = (name: string, data: unknown, durable = true) => {
+      const pending = writeTail.then(() => this.events.append(run.id, name, data, durable));
       writeTail = pending.catch(() => undefined);
       return pending;
     };
+    let finalValues: RunEvent | null = null;
+    const modes = new Set(Array.isArray(run.metadata.__stream_modes)
+      ? run.metadata.__stream_modes.filter((mode): mode is string => typeof mode === "string") : []);
     if (graph.streamEvents) {
-      const trace = new V1TraceHandler(event => append("trace", event));
-      const native = await graph.streamEvents(input, { ...config, callbacks: [trace], version: "v3" });
+      // LangChain callback traces are only produced, and kept for replay, for clients that asked for v1 "events".
+      const callbacks = modes.has("events") ? [new V1TraceHandler(event => append("trace", event))] : [];
+      const native = await graph.streamEvents(input, { ...config, callbacks, version: "v3" });
       for await (const event of native) {
         await this.ensureActive(run.id);
         const wire = toWire(event) as ProtocolEvent;
@@ -605,19 +630,14 @@ export class GraphRuntime {
           terminalV2 = wire;
           continue;
         }
-        await append("v2", wire);
-        const data = wire.params.data;
-        if (wire.params.namespace.length === 0 && wire.method === "updates") {
-          const update = isObject(data) && typeof data.node === "string"
-            ? { [data.node]: data.values } : data;
-          if (isObject(update) && "__interrupt__" in update) sawInterruptUpdate = true;
-          await append("updates", update);
-        } else if (wire.params.namespace.length === 0 && wire.method === "values") {
-          await append("values", data);
-        } else if (["custom", "tools", "checkpoints", "tasks"].includes(wire.method)) {
-          await append(wire.method, data);
-        }
+        const recorded = await append("v2", wire, durableV2(wire, modes));
+        if (wire.method === "values" && wire.params.namespace.length === 0) finalValues = recorded as RunEvent | null;
+        if (wire.method === "updates" && wire.params.namespace.length === 0 && isObject(wire.params.data) &&
+          isObject(wire.params.data.values) && "__interrupt__" in wire.params.data.values) sawInterruptUpdate = true;
       }
+      // Of the per-step full states, only the run's final one is kept for replay; the thread state has the rest.
+      await writeTail;
+      if (finalValues) this.events.keep(run.id, finalValues);
     } else {
       for await (const chunk of await graph.stream(input, config)) {
         await this.ensureActive(run.id);
@@ -640,7 +660,7 @@ export class GraphRuntime {
       step: (previous?.step ?? 0) + 1, values, next, tasks, interrupts,
       parentId: previous?.id ?? null });
     const status = interrupts.length || next.length ? "interrupted" : "success";
-    if (interrupts.length && !sawInterruptUpdate) await append("updates", { __interrupt__: interrupts });
+    if (interrupts.length && !sawInterruptUpdate && !graph.streamEvents) await append("updates", { __interrupt__: interrupts });
     if (graph.streamEvents) {
       if (status === "interrupted") {
         let seq = terminalV2?.seq ?? lastV2Seq + 1;
@@ -659,9 +679,10 @@ export class GraphRuntime {
         await append("v2", terminalV2);
       }
     }
-    if (!await this.finishRun(run, status, values)) return;
+    // The final values are the thread state; repeating them on the run row and end event would copy the history per run.
+    if (!await this.finishRun(run, status)) return;
     await this.settleThread(run.threadId, status === "success" ? "idle" : "interrupted");
-    await append("end", { status, output: values });
+    await append("end", { status });
   }
 
   async updateState(threadId: string, update: State, asNode?: string, checkpointId?: string):
@@ -718,7 +739,7 @@ export class GraphRuntime {
     // Decided before aborting: a local execution may be gone by the time we look again.
     const local = this.active.has(runId);
     this.controls.get(runId)?.controller.abort(new Error("Run cancelled"));
-    await this.store.appendEvent(runId, "end", { status: "cancelled" });
+    await this.events.append(runId, "end", { status: "cancelled" });
     if (local && before.status === "running") {
       const deadline = Date.now() + Math.max(this.runLeaseMs, 1_000);
       while (this.active.has(runId) && Date.now() < deadline) await sleep(20);
@@ -740,53 +761,54 @@ export class GraphRuntime {
       await sleep(pollMs);
     }
   }
+  private async runFinished(runId: string): Promise<boolean> {
+    const run = await this.store.getRun(runId);
+    return !run || completed.has(run.status);
+  }
+  /**
+   * Legacy (pre-v3) view of a run. Compiled graphs record only v3 envelopes; their legacy
+   * values/updates/custom/tools/checkpoints/tasks events are derived from them on read.
+   */
   async *stream(runId: string, options: StreamOptions = {}): AsyncGenerator<{ event: string; data: unknown; id: string }> {
-    let after = options.after ?? 0;
-    for (;;) {
-      if (options.signal?.aborted) return;
-      const batch = await this.store.listEvents(runId, after);
-      for (const item of batch) {
-        after = item.seq;
-        if (item.event !== "v2" && item.event !== "trace") {
-          yield { event: item.event, data: item.data, id: String(item.seq) };
-        }
+    let sawInterrupt = false;
+    for await (const item of this.events.read(runId, { ...options, finished: () => this.runFinished(runId) })) {
+      const id = String(item.seq);
+      if (item.event === "trace") continue;
+      if (item.event !== "v2") { yield { event: item.event, data: item.data, id }; continue; }
+      const { method, params } = item.data as ProtocolEvent;
+      const data = params.data;
+      const root = params.namespace.length === 0;
+      if (root && method === "updates") {
+        const update = isObject(data) && typeof data.node === "string" ? { [data.node]: data.values } : data;
+        if (isObject(update) && "__interrupt__" in update) sawInterrupt = true;
+        yield { event: "updates", data: update, id };
+      } else if (root && method === "values") {
+        yield { event: "values", data, id };
+      } else if (root && method === "input.requested" && !sawInterrupt && isObject(data)) {
+        yield { event: "updates", data: { __interrupt__: [{ id: data.interrupt_id, value: data.payload }] }, id };
+      } else if (["custom", "tools", "checkpoints", "tasks"].includes(method)) {
+        yield { event: method, data, id };
       }
-      const run = await this.store.getRun(runId);
-      if (!run || (completed.has(run.status) && batch.length === 0)) return;
-      await sleep(options.pollMs ?? 100);
     }
   }
-  /** Replay and follow every stored event, including v3 envelopes and captured v1 callbacks. */
+  /** Replay and follow every recorded event, including v3 envelopes and captured v1 callbacks. */
   async *streamAll(runId: string, options: StreamOptions = {}): AsyncGenerator<{ event: string; data: unknown; id: string }> {
-    let after = options.after ?? 0;
-    for (;;) {
-      if (options.signal?.aborted) return;
-      const batch = await this.store.listEvents(runId, after);
-      for (const item of batch) {
-        after = item.seq;
-        yield { event: item.event, data: item.data, id: String(item.seq) };
-      }
-      const run = await this.store.getRun(runId);
-      if (!run || (completed.has(run.status) && batch.length === 0)) return;
-      await sleep(options.pollMs ?? 100);
+    for await (const item of this.events.read(runId, { ...options, finished: () => this.runFinished(runId) })) {
+      yield { event: item.event, data: item.data, id: String(item.seq) };
     }
   }
   /** Replay and follow native LangGraph v3 protocol envelopes for one run. */
   async *streamV2(runId: string, options: StreamOptions = {}): AsyncGenerator<V2RecordedEvent> {
-    let after = options.after ?? 0;
-    for (;;) {
-      if (options.signal?.aborted) return;
-      const batch = await this.store.listEvents(runId, after);
-      for (const item of batch) {
-        after = item.seq;
-        if (item.event === "v2") yield { id: String(item.seq), event: item.data as ProtocolEvent };
-      }
-      const run = await this.store.getRun(runId);
-      if (!run || (completed.has(run.status) && batch.length === 0)) return;
-      await sleep(options.pollMs ?? 100);
+    for await (const item of this.events.read(runId, { ...options, finished: () => this.runFinished(runId) })) {
+      if (item.event === "v2") yield { id: String(item.seq), event: item.data as ProtocolEvent };
     }
   }
-  async close(): Promise<void> { if (this.recoveryTimer) clearInterval(this.recoveryTimer); await this.queue?.close(); await this.store.close(); }
+  async close(): Promise<void> {
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    await this.queue?.close();
+    await this.events.flushAll();
+    await this.store.close();
+  }
 }
 
 export async function createRuntime(config: RuntimeConfig): Promise<GraphRuntime> {

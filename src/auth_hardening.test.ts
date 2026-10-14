@@ -107,7 +107,8 @@ test("clients cannot reassign thread ownership or inject runtime metadata", asyn
     const runs = await (await send(`/threads/${thread.thread_id}/runs`, "GET", "alice")).json() as
       Array<{ run_id: string; metadata: unknown }>;
     expect(runs[0]!.metadata).toEqual({ note: "kept" });
-    expect((await runtime.store.getRun(runs[0]!.run_id))!.metadata).toEqual({ note: "kept" });
+    // Only the server's own reserved keys may appear; the client's were dropped.
+    expect((await runtime.store.getRun(runs[0]!.run_id))!.metadata).toEqual({ note: "kept", __stream_modes: ["values"] });
 
     const copy = await (await send(`/threads/${thread.thread_id}/copy`, "POST", "alice")).json() as
       { metadata: Record<string, unknown> };
