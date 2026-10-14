@@ -59,6 +59,17 @@ Open `http://localhost:3000`. Select `approval` with `?assistantId=approval` to 
 
 For CopilotKit or another AG-UI client, point its official `HttpAgent` at `POST /ag-ui/:assistantId`. This backend endpoint streams text, graph tool calls/results, state snapshots, and HITL outcomes. It uses the same auth middleware as the Agent Protocol routes. See [AG-UI endpoint](./src/api/ag_ui.md) for the supported event set and current limits. It does not add a UI to this repository.
 
+## Concurrent runs on a thread
+
+A thread runs one graph at a time. A new run on a busy thread follows its `multitask_strategy`, as on LangGraph's server:
+
+- `enqueue` (the default) waits as `pending` and starts after the earlier runs, in order, from the state they leave. The thread stays `busy` until the queue is empty.
+- `reject` answers 409 `Thread is already running a task...`.
+- `interrupt` cancels the thread's pending and running runs and starts once the running one has stopped. Their checkpoints are kept, and the API reports them as `interrupted`.
+- `rollback` does the same and then deletes those runs with their checkpoints, so the thread is back where it was before them.
+
+AG-UI clients pass the strategy as `forwardedProps.multitask_strategy`. `POST /threads/{thread_id}/runs/{run_id}/cancel` answers 202, or with `wait=true` the final values once the run has stopped, and 404 when the run is not pending or running. `action=rollback` also deletes it. `POST /runs/cancel` cancels several runs, given `{thread_id, run_ids}` or `{status: "pending" | "running" | "all"}`.
+
 ## PostgreSQL, Redis, and workers
 
 ```bash

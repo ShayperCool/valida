@@ -15,6 +15,7 @@ describe("Agent Protocol authorization routes", () => {
     ["POST", "/threads/one/copy", "threads", "create", { thread_id: "one" }],
     ["POST", "/threads/one/runs/stream", "threads", "create_run", { thread_id: "one" }],
     ["POST", "/threads/one/runs/run-1/cancel", "threads", "update", { thread_id: "one", run_id: "run-1" }],
+    ["POST", "/runs/cancel", "threads", "update", {}],
     ["DELETE", "/threads/one/runs/run-1", "threads", "delete", { thread_id: "one", run_id: "run-1" }],
     ["POST", "/runs/crons", "crons", "create", {}],
     ["POST", "/threads/one/runs/crons", "crons", "create", { thread_id: "one" }],

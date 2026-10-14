@@ -1,6 +1,7 @@
 import type { Store, AssistantRecord, ThreadRecord, RunRecord, CheckpointRecord } from "./db/index.ts";
 import { Overwrite } from "@langchain/langgraph";
-import type { GraphStateSnapshot } from "./engine/index.ts";
+import { MULTITASK_STRATEGIES, ThreadBusyError, type CancelAction, type GraphStateSnapshot,
+  type MultitaskStrategy } from "./engine/index.ts";
 import { describeGraph } from "./engine/introspection.ts";
 import type { PlatformAdapter, JsonRecord, Assistant, Thread, Run, ThreadState, Checkpoint } from "./api/types.ts";
 import { ApiError } from "./api/types.ts";
@@ -16,10 +17,12 @@ type RuntimeHandle = {
   startRun(input: {
     threadId: string; graphId: string; assistantId?: string;
     input?: unknown; config?: JsonRecord; metadata?: JsonRecord;
+    multitaskStrategy?: MultitaskStrategy;
   }): Promise<RunRecord>;
   resumeRun(input: { threadId: string; resume: unknown; graphId?: string;
     assistantId?: string; config?: JsonRecord; metadata?: JsonRecord;
-    update?: JsonRecord; goto?: string | string[] }): Promise<RunRecord>;
+    update?: JsonRecord; goto?: string | string[]; multitaskStrategy?: MultitaskStrategy }): Promise<RunRecord>;
+  cancelRun?(runId: string, action?: CancelAction): Promise<RunRecord | null>;
   getRun(id: string): Promise<RunRecord | null>;
   stream(id: string, options?: { after?: number; pollMs?: number }): AsyncIterable<{ event: string; data: unknown; id: string }>;
   updateState(threadId: string, update: JsonRecord, asNode?: string, checkpointId?: string):
@@ -30,6 +33,13 @@ type RuntimeHandle = {
   captureTraceContext?(): { traceparent?: string; tracestate?: string } | undefined;
 };
 
+const BUSY_MESSAGE = "Thread is already running a task. Wait for it to finish or choose a different multitask strategy.";
+/** LangGraph's server queues by default (since langgraph-api 0.2.130); reject must be asked for. */
+function multitaskStrategy(value: unknown): MultitaskStrategy {
+  if (value == null) return "enqueue";
+  if (MULTITASK_STRATEGIES.includes(value as MultitaskStrategy)) return value as MultitaskStrategy;
+  throw new ApiError(422, `Invalid multitask_strategy '${String(value)}'`);
+}
 const object = (value: unknown): JsonRecord =>
   value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 const number = (value: unknown, fallback: number) => {
@@ -47,7 +57,8 @@ const apiThread = (record: ThreadRecord): Thread => ({
 });
 const apiRun = (record: RunRecord): Run => ({
   run_id: record.id, thread_id: record.threadId, assistant_id: record.assistantId ?? record.graphId,
-  status: record.status === "cancelled" ? "error" : record.status,
+  // LangGraph reports a cancelled or superseded run as interrupted.
+  status: record.status === "cancelled" ? "interrupted" : record.status,
   metadata: Object.fromEntries(Object.entries(record.metadata).filter(([key]) => !key.startsWith("__"))),
   created_at: record.createdAt, updated_at: record.updatedAt,
 });
@@ -407,6 +418,7 @@ export function createPlatformAdapter(
     },
     runs: {
       async create(threadId, payload) {
+        const strategy = multitaskStrategy(payload.multitask_strategy);
         const assistantId = String(payload.assistant_id);
         const assistant = await getAssistant(assistantId);
         if (!assistant) throw new ApiError(404, `Assistant '${assistantId}' not found`);
@@ -446,17 +458,18 @@ export function createPlatformAdapter(
             }
           }
         }
-        const run = resumed
-          ? await runtime.resumeRun({ threadId: thread.id,
+        const run = await (resumed
+          ? runtime.resumeRun({ threadId: thread.id,
             resume: command.resume ?? object(payload.input).respond,
             update: command.update === undefined ? undefined : object(command.update),
             goto: typeof command.goto === "string" ||
               (Array.isArray(command.goto) && command.goto.every(item => typeof item === "string"))
               ? command.goto as string | string[] : undefined,
             graphId: assistant.graphId, assistantId, config: runConfig,
-            metadata })
-          : await runtime.startRun({ threadId: thread.id, graphId: assistant.graphId, assistantId,
-            input: payload.input ?? {}, config: runConfig, metadata });
+            metadata, multitaskStrategy: strategy })
+          : runtime.startRun({ threadId: thread.id, graphId: assistant.graphId, assistantId,
+            input: payload.input ?? {}, config: runConfig, metadata, multitaskStrategy: strategy }))
+          .catch(cause => { throw cause instanceof ThreadBusyError ? new ApiError(409, BUSY_MESSAGE) : cause; });
         return apiRun(run);
       },
       async get(threadId, runId) { const row = await getRun(runId, threadId); return row ? apiRun(row) : null; },
@@ -482,9 +495,13 @@ export function createPlatformAdapter(
           yield { id: event.id, event: event.event, data: event.data };
         }
       },
-      async cancel(threadId, runId) {
+      async cancel(threadId, runId, action) {
         const existing = await getRun(runId, threadId);
-        if (!existing) return false;
+        if (!existing || !["pending", "running"].includes(existing.status)) return false;
+        if (runtime.cancelRun) {
+          await runtime.cancelRun(runId, action);
+          return true;
+        }
         const cancelled = await store.cancelRun(runId);
         if (cancelled) {
           const state = await store.getState(cancelled.threadId);
@@ -494,6 +511,35 @@ export function createPlatformAdapter(
           await store.appendEvent(runId, "end", { status: "cancelled" });
         }
         return true;
+      },
+      async cancelMany(payload, action) {
+        const status = payload.status;
+        if (status != null && (payload.thread_id != null || payload.run_ids != null)) {
+          throw new ApiError(422, "Specify either status or thread_id with run_ids");
+        }
+        let targets: RunRecord[];
+        if (status != null) {
+          if (!["pending", "running", "all"].includes(String(status))) throw new ApiError(422, `Invalid status '${String(status)}'`);
+          targets = [];
+          for (const run of await store.listActiveRuns()) {
+            if (status !== "all" && run.status !== status) continue;
+            if (visible(await store.getThread(run.threadId))) targets.push(run);
+          }
+        } else {
+          if (typeof payload.thread_id !== "string" || !Array.isArray(payload.run_ids) ||
+            !payload.run_ids.every(id => typeof id === "string")) {
+            throw new ApiError(422, "thread_id and run_ids are required unless status is given");
+          }
+          if (!await getThread(payload.thread_id)) return 0;
+          const ids = new Set(payload.run_ids as string[]);
+          targets = (await store.listActiveRuns(payload.thread_id)).filter(run => ids.has(run.id));
+        }
+        // Later runs first, so cancelling a running run does not briefly start one about to be cancelled.
+        for (const run of targets.reverse()) {
+          if (runtime.cancelRun) await runtime.cancelRun(run.id, action);
+          else await store.cancelRun(run.id);
+        }
+        return targets.length;
       },
     },
     async health() { return { status: "healthy", database: store.dialect,

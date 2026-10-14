@@ -49,6 +49,8 @@ runtime.registerGraph({ id: "approval", graph });
 runtime.startWorker(); // call only in worker processes
 ```
 
+`startRun` and `resumeRun` take `multitaskStrategy` (`reject` by default here, `enqueue` over HTTP). A busy thread with `reject` throws `ThreadBusyError`. `cancelRun(runId, action?)` cancels a pending or running run, aborts it at once when it executes in this process, and with `"rollback"` deletes the run and what it wrote. The next queued run of the thread then starts.
+
 When `queue` is set, `startRun` and `resumeRun` enqueue durable BullMQ jobs. API processes can omit `startWorker`. Set `inline: true` only when the current instance should also process runs. The queue job ID is the run ID, and database run claiming prevents duplicate workers from executing the same pending run.
 
 In standalone mode, the runtime scans for pending runs and expired leases every five seconds after graphs register. It continues a custom graph from its last completed checkpoint. BullMQ replacement workers wait for the prior database lease to expire before taking a stalled run.

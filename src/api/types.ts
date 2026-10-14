@@ -96,7 +96,10 @@ export interface PlatformAdapter {
     join(threadId: string | null, runId: string, context: ApiRequestContext): Promise<unknown>;
     /** Replay after lastEventId and then follow a live run. Emit LangGraph SSE event names. */
     events(threadId: string | null, runId: string, lastEventId: string | null, context: ApiRequestContext): AsyncIterable<StreamEvent>;
+    /** Cancel a pending or running run; false when there is no such active run. */
     cancel(threadId: string, runId: string, action: "interrupt" | "rollback", context: ApiRequestContext): Promise<boolean>;
+    /** POST /runs/cancel: either {thread_id, run_ids} or {status: pending | running | all}. Returns how many were cancelled. */
+    cancelMany?(payload: JsonRecord, action: "interrupt" | "rollback", context: ApiRequestContext): Promise<number>;
     update?(threadId: string, runId: string, payload: JsonRecord, context: ApiRequestContext): Promise<Run | null>;
     delete?(threadId: string, runId: string, context: ApiRequestContext): Promise<boolean>;
   };

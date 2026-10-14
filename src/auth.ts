@@ -133,6 +133,7 @@ export function routeAuthTarget(method: string, path: string): AuthTarget | null
   }
 
   if (root === "runs") {
+    if (second === "cancel" && method === "POST") return target("threads", "update");
     if (second && !["stream", "wait", "batch"].includes(second)) params.run_id = second;
     if (method === "POST") return target("threads", "create_run");
     if (method === "GET") return target("threads", "read");
