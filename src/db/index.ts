@@ -142,6 +142,9 @@ export class Store {
     });
   }
 
+  /** Column type for serialized LangGraph values. */
+  private get binary(): string { return this.pgDb ? "BYTEA" : "BLOB"; }
+
   async migrate(): Promise<void> {
     // Text-encoded JSON keeps the two schemas equivalent and migration between them mechanical.
     const statements = [
@@ -151,13 +154,16 @@ export class Store {
       `CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, assistant_id TEXT, graph_id TEXT NOT NULL, status TEXT NOT NULL, input TEXT, output TEXT, error TEXT, config TEXT NOT NULL, metadata TEXT NOT NULL, resume TEXT, lease_until TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, run_id TEXT NOT NULL, graph_id TEXT NOT NULL, step INTEGER NOT NULL, state_values TEXT NOT NULL, next TEXT NOT NULL, tasks TEXT NOT NULL, interrupts TEXT NOT NULL, parent_id TEXT, created_at TEXT NOT NULL)`,
       `CREATE TABLE IF NOT EXISTS events (run_id TEXT NOT NULL, seq INTEGER NOT NULL, event TEXT NOT NULL, data TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (run_id, seq))`,
-      `CREATE TABLE IF NOT EXISTS lg_checkpoints (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, parent_id TEXT, checkpoint_type TEXT NOT NULL, checkpoint_blob TEXT NOT NULL, metadata_type TEXT NOT NULL, metadata_blob TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))`,
-      `CREATE TABLE IF NOT EXISTS lg_writes (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, write_idx INTEGER NOT NULL, channel TEXT NOT NULL, value_type TEXT NOT NULL, value_blob TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, write_idx))`,
       `CREATE INDEX IF NOT EXISTS runs_thread_created ON runs (thread_id, created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS thread_ttl_expires_at ON thread_ttl (expires_at)`,
       `CREATE INDEX IF NOT EXISTS runs_status_lease ON runs (status, lease_until)`,
       `CREATE INDEX IF NOT EXISTS checkpoints_thread_created ON checkpoints (thread_id, created_at DESC)`,
-      `CREATE INDEX IF NOT EXISTS lg_checkpoints_latest ON lg_checkpoints (thread_id, checkpoint_ns, checkpoint_id DESC)`,
+      // LangGraph checkpoints in the PostgresSaver layout: channel values live in per-version blobs,
+      // and messages inside blobs and writes are stored once per thread (see DrizzleCheckpointer).
+      `CREATE TABLE IF NOT EXISTS lg_checkpoints_v2 (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, parent_checkpoint_id TEXT, checkpoint_type TEXT NOT NULL, checkpoint ${this.binary} NOT NULL, metadata TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id))`,
+      `CREATE TABLE IF NOT EXISTS lg_blobs (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, channel TEXT NOT NULL, version TEXT NOT NULL, type TEXT NOT NULL, blob ${this.binary}, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, channel, version))`,
+      `CREATE TABLE IF NOT EXISTS lg_checkpoint_writes (thread_id TEXT NOT NULL, checkpoint_ns TEXT NOT NULL, checkpoint_id TEXT NOT NULL, task_id TEXT NOT NULL, task_path TEXT NOT NULL DEFAULT '', idx INTEGER NOT NULL, channel TEXT NOT NULL, type TEXT NOT NULL, blob ${this.binary} NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id, task_id, idx))`,
+      `CREATE TABLE IF NOT EXISTS lg_messages (thread_id TEXT NOT NULL, hash TEXT NOT NULL, type TEXT NOT NULL, blob ${this.binary} NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (thread_id, hash))`,
     ];
     if (this.pgDb) {
       // CREATE INDEX IF NOT EXISTS is still racy across concurrent PostgreSQL
@@ -246,8 +252,10 @@ export class Store {
   }
   async deleteThread(id: string): Promise<void> {
     await this.transaction([
-      sql`DELETE FROM lg_writes WHERE thread_id = ${id}`,
-      sql`DELETE FROM lg_checkpoints WHERE thread_id = ${id}`,
+      sql`DELETE FROM lg_checkpoint_writes WHERE thread_id = ${id}`,
+      sql`DELETE FROM lg_blobs WHERE thread_id = ${id}`,
+      sql`DELETE FROM lg_checkpoints_v2 WHERE thread_id = ${id}`,
+      sql`DELETE FROM lg_messages WHERE thread_id = ${id}`,
       sql`DELETE FROM events WHERE run_id IN (SELECT id FROM runs WHERE thread_id = ${id})`,
       sql`DELETE FROM checkpoints WHERE thread_id = ${id}`,
       sql`DELETE FROM runs WHERE thread_id = ${id}`,
@@ -332,9 +340,11 @@ export class Store {
       WHERE run_id = ${id} AND event = ${"run"}`);
     await this.transaction([
       ...(started?.at ? [
-        sql`DELETE FROM lg_writes WHERE thread_id = ${target.threadId} AND checkpoint_id IN
-          (SELECT checkpoint_id FROM lg_checkpoints WHERE thread_id = ${target.threadId} AND created_at >= ${started.at})`,
-        sql`DELETE FROM lg_checkpoints WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
+        // Everything the checkpointer stored since then; a message first stored then is the run's own.
+        sql`DELETE FROM lg_checkpoint_writes WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
+        sql`DELETE FROM lg_checkpoints_v2 WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
+        sql`DELETE FROM lg_blobs WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
+        sql`DELETE FROM lg_messages WHERE thread_id = ${target.threadId} AND created_at >= ${started.at}`,
       ] : []),
       sql`DELETE FROM checkpoints WHERE run_id = ${id}`,
       sql`DELETE FROM events WHERE run_id = ${id}`,

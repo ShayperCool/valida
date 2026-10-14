@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import type { Store, ThreadRecord, ThreadTtlStrategy } from "../db/index.ts";
 import { ApiError } from "../api/types.ts";
+import { DrizzleCheckpointer } from "../engine/checkpointer.ts";
 
 export interface ThreadPrunerOptions {
   /** Keep stateless run results and replayable events this long after the last thread update. */
@@ -93,20 +94,13 @@ export class ThreadPruner {
           SELECT id FROM checkpoints WHERE thread_id = ${row.id}
           ORDER BY step DESC, created_at DESC, id DESC LIMIT 1)`,
         sql`UPDATE checkpoints SET parent_id = ${null} WHERE thread_id = ${row.id}`,
-        sql`DELETE FROM lg_checkpoints WHERE thread_id = ${row.id}
-          AND checkpoint_id <> (SELECT MAX(newest.checkpoint_id) FROM lg_checkpoints AS newest
-            WHERE newest.thread_id = lg_checkpoints.thread_id
-              AND newest.checkpoint_ns = lg_checkpoints.checkpoint_ns)`,
-        sql`DELETE FROM lg_writes WHERE thread_id = ${row.id} AND NOT EXISTS (
-          SELECT 1 FROM lg_checkpoints AS kept WHERE kept.thread_id = lg_writes.thread_id
-            AND kept.checkpoint_ns = lg_writes.checkpoint_ns
-            AND kept.checkpoint_id = lg_writes.checkpoint_id)`,
-        sql`UPDATE lg_checkpoints SET parent_id = ${null} WHERE thread_id = ${row.id}`,
         ...(ttl ? [sql`UPDATE thread_ttl SET expires_at =
           ${new Date(new Date(ttl.now).getTime() + ttl.ttlMinutes * 60_000).toISOString()}
           WHERE thread_id = ${row.id} AND expires_at = ${ttl.expiresAt}`] : []),
-        sql`UPDATE threads SET status = ${row.status} WHERE id = ${row.id} AND status = ${"busy"}`,
       ]);
+      // Native checkpoints keep, per namespace, the latest one and what its DeltaChannels replay from.
+      await new DrizzleCheckpointer(this.store).pruneToLatest(row.id);
+      await this.store.exec(sql`UPDATE threads SET status = ${row.status} WHERE id = ${row.id} AND status = ${"busy"}`);
       return true;
     } catch (error) {
       await this.store.exec(sql`UPDATE threads SET status = ${row.status}

@@ -1,4 +1,4 @@
-import { index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { blob, index, integer, primaryKey, real, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
 export const assistants = sqliteTable("assistants", {
   id: text("id").primaryKey(), graphId: text("graph_id").notNull(),
@@ -37,19 +37,29 @@ export const events = sqliteTable("events", {
   event: text("event").notNull(), data: text("data").notNull(),
   createdAt: text("created_at").notNull(),
 }, table => [primaryKey({ columns: [table.runId, table.seq] })]);
-export const lgCheckpoints = sqliteTable("lg_checkpoints", {
+// LangGraph checkpoints in the PostgresSaver layout; messages are stored once per thread.
+export const lgCheckpoints = sqliteTable("lg_checkpoints_v2", {
   threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
-  checkpointId: text("checkpoint_id").notNull(), parentId: text("parent_id"),
-  checkpointType: text("checkpoint_type").notNull(), checkpointBlob: text("checkpoint_blob").notNull(),
-  metadataType: text("metadata_type").notNull(), metadataBlob: text("metadata_blob").notNull(),
-  createdAt: text("created_at").notNull(),
+  checkpointId: text("checkpoint_id").notNull(), parentCheckpointId: text("parent_checkpoint_id"),
+  checkpointType: text("checkpoint_type").notNull(), checkpoint: blob("checkpoint", { mode: "buffer" }).notNull(),
+  metadata: text("metadata").notNull(), createdAt: text("created_at").notNull(),
 }, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId] })]);
-export const lgWrites = sqliteTable("lg_writes", {
+export const lgBlobs = sqliteTable("lg_blobs", {
+  threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
+  channel: text("channel").notNull(), version: text("version").notNull(), type: text("type").notNull(),
+  blob: blob("blob", { mode: "buffer" }), createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.channel, table.version] })]);
+export const lgCheckpointWrites = sqliteTable("lg_checkpoint_writes", {
   threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
   checkpointId: text("checkpoint_id").notNull(), taskId: text("task_id").notNull(),
-  writeIdx: integer("write_idx").notNull(), channel: text("channel").notNull(),
-  valueType: text("value_type").notNull(), valueBlob: text("value_blob").notNull(),
-}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.writeIdx] })]);
+  taskPath: text("task_path").notNull().default(""), idx: integer("idx").notNull(),
+  channel: text("channel").notNull(), type: text("type").notNull(), blob: blob("blob", { mode: "buffer" }).notNull(),
+  createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.idx] })]);
+export const lgMessages = sqliteTable("lg_messages", {
+  threadId: text("thread_id").notNull(), hash: text("hash").notNull(), type: text("type").notNull(),
+  blob: blob("blob", { mode: "buffer" }).notNull(), createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.hash] })]);
 
 export const storeItems = sqliteTable("valida_store_items", {
   namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),

@@ -73,9 +73,9 @@ test("SDK thread copy resumes an interrupted compiled graph independently", asyn
     expect(copiedPending.next).toContain("approve");
     expect(copiedPending.values).toMatchObject({ proposal: "ship" });
     const sourceWrites = await runtime.store.rows<{ count: number }>(sql`SELECT COUNT(*) AS count
-      FROM lg_writes WHERE thread_id = ${source.thread_id}`);
+      FROM lg_checkpoint_writes WHERE thread_id = ${source.thread_id}`);
     const copiedWrites = await runtime.store.rows<{ count: number }>(sql`SELECT COUNT(*) AS count
-      FROM lg_writes WHERE thread_id = ${copied.thread_id}`);
+      FROM lg_checkpoint_writes WHERE thread_id = ${copied.thread_id}`);
     expect(Number(copiedWrites[0]?.count)).toBe(Number(sourceWrites[0]?.count));
     expect(Number(copiedWrites[0]?.count)).toBeGreaterThan(0);
 
