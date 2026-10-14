@@ -3,6 +3,7 @@ import { customType, doublePrecision, index, integer, pgTable, primaryKey, text 
 
 // Configured models may have different dimensions, so the HNSW index uses a
 // per-dimension cast and predicate instead of a fixed column dimension.
+const bytea = customType<{ data: Uint8Array }>({ dataType: () => "bytea" });
 const vector = customType<{ data: number[]; driverData: string }>({
   dataType: () => "vector",
   toDriver: value => JSON.stringify(value),
@@ -46,19 +47,29 @@ export const events = pgTable("events", {
   event: text("event").notNull(), data: text("data").notNull(),
   createdAt: text("created_at").notNull(),
 }, table => [primaryKey({ columns: [table.runId, table.seq] })]);
-export const lgCheckpoints = pgTable("lg_checkpoints", {
+// LangGraph checkpoints in the PostgresSaver layout; messages are stored once per thread.
+export const lgCheckpoints = pgTable("lg_checkpoints_v2", {
   threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
-  checkpointId: text("checkpoint_id").notNull(), parentId: text("parent_id"),
-  checkpointType: text("checkpoint_type").notNull(), checkpointBlob: text("checkpoint_blob").notNull(),
-  metadataType: text("metadata_type").notNull(), metadataBlob: text("metadata_blob").notNull(),
-  createdAt: text("created_at").notNull(),
+  checkpointId: text("checkpoint_id").notNull(), parentCheckpointId: text("parent_checkpoint_id"),
+  checkpointType: text("checkpoint_type").notNull(), checkpoint: bytea("checkpoint").notNull(),
+  metadata: text("metadata").notNull(), createdAt: text("created_at").notNull(),
 }, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId] })]);
-export const lgWrites = pgTable("lg_writes", {
+export const lgBlobs = pgTable("lg_blobs", {
+  threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
+  channel: text("channel").notNull(), version: text("version").notNull(), type: text("type").notNull(),
+  blob: bytea("blob"), createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.channel, table.version] })]);
+export const lgCheckpointWrites = pgTable("lg_checkpoint_writes", {
   threadId: text("thread_id").notNull(), namespace: text("checkpoint_ns").notNull(),
   checkpointId: text("checkpoint_id").notNull(), taskId: text("task_id").notNull(),
-  writeIdx: integer("write_idx").notNull(), channel: text("channel").notNull(),
-  valueType: text("value_type").notNull(), valueBlob: text("value_blob").notNull(),
-}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.writeIdx] })]);
+  taskPath: text("task_path").notNull().default(""), idx: integer("idx").notNull(),
+  channel: text("channel").notNull(), type: text("type").notNull(), blob: bytea("blob").notNull(),
+  createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.namespace, table.checkpointId, table.taskId, table.idx] })]);
+export const lgMessages = pgTable("lg_messages", {
+  threadId: text("thread_id").notNull(), hash: text("hash").notNull(), type: text("type").notNull(),
+  blob: bytea("blob").notNull(), createdAt: text("created_at").notNull(),
+}, table => [primaryKey({ columns: [table.threadId, table.hash] })]);
 
 export const storeItems = pgTable("valida_store_items", {
   namespace: text("namespace").notNull(), itemKey: text("item_key").notNull(),

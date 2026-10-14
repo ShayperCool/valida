@@ -1,6 +1,7 @@
 import { sql, type SQL } from "drizzle-orm";
 import type { Store, ThreadRecord } from "../db/index.ts";
 import { ApiError } from "../api/types.ts";
+import { DrizzleCheckpointer } from "../engine/checkpointer.ts";
 
 interface LegacyCheckpointRow {
   id: string;
@@ -50,15 +51,7 @@ export async function copyThread(store: Store, source: ThreadRecord, owner?: str
     // Native IDs remain stable inside the new thread. LangGraph's checkpointer
     // keys by (thread_id, namespace, checkpoint_id), and serialized parent
     // references and pending task writes therefore stay consistent.
-    statements.push(sql`INSERT INTO lg_checkpoints (thread_id, checkpoint_ns, checkpoint_id,
-      parent_id, checkpoint_type, checkpoint_blob, metadata_type, metadata_blob, created_at)
-      SELECT ${threadId}, checkpoint_ns, checkpoint_id, parent_id, checkpoint_type,
-        checkpoint_blob, metadata_type, metadata_blob, created_at FROM lg_checkpoints
-      WHERE thread_id = ${source.id}`);
-    statements.push(sql`INSERT INTO lg_writes (thread_id, checkpoint_ns, checkpoint_id,
-      task_id, write_idx, channel, value_type, value_blob)
-      SELECT ${threadId}, checkpoint_ns, checkpoint_id, task_id, write_idx, channel,
-        value_type, value_blob FROM lg_writes WHERE thread_id = ${source.id}`);
+    statements.push(...new DrizzleCheckpointer(store).copyThreadStatements(source.id, threadId));
     await store.transaction(statements);
     return (await store.getThread(threadId))!;
   } finally {

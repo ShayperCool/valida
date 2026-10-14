@@ -37,14 +37,14 @@ test("stateless sweep removes finished ephemeral checkpoints but preserves pendi
 
     await runtime.executeRun(pending.run_id);
     expect((await runtime.store.getRun(pending.run_id))?.status).toBe("success");
-    expect(await count(runtime, "lg_checkpoints", pending.thread_id)).toBeGreaterThan(0);
+    expect(await count(runtime, "lg_checkpoints_v2", pending.thread_id)).toBeGreaterThan(0);
     expect(await count(runtime, "events", pending.run_id)).toBeGreaterThan(0);
     await runtime.store.exec(sql`UPDATE threads SET updated_at = ${old} WHERE id = ${pending.thread_id}`);
     expect(await pruner.sweep()).toBe(1);
     expect(await runtime.store.getThread(pending.thread_id)).toBeNull();
     expect(await runtime.store.getRun(pending.run_id)).toBeNull();
-    expect(await count(runtime, "lg_checkpoints", pending.thread_id)).toBe(0);
-    expect(await count(runtime, "lg_writes", pending.thread_id)).toBe(0);
+    expect(await count(runtime, "lg_checkpoints_v2", pending.thread_id)).toBe(0);
+    expect(await count(runtime, "lg_checkpoint_writes", pending.thread_id)).toBe(0);
     expect(await count(runtime, "checkpoints", pending.thread_id)).toBe(0);
     expect(await count(runtime, "events", pending.run_id)).toBe(0);
     expect(await runtime.store.getThread(normal.id)).not.toBeNull();
@@ -104,13 +104,13 @@ test("SDK keep_latest preserves compiled graph state and future runs", async () 
     const thread = await client.threads.create();
     await client.runs.wait(thread.thread_id, "counter", { input: { count: 1 } });
     await client.runs.wait(thread.thread_id, "counter", { input: {} });
-    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
+    expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBeGreaterThan(1);
     expect(await count(runtime, "checkpoints", thread.thread_id)).toBeGreaterThan(1);
 
     expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
       .toMatchObject({ pruned_count: 1 });
     expect(await runtime.store.getThread(thread.thread_id)).not.toBeNull();
-    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
+    expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBe(1);
     expect(await count(runtime, "checkpoints", thread.thread_id)).toBe(1);
     expect((await client.threads.getState(thread.thread_id)).values).toMatchObject({ count: 3 });
     expect((await client.threads.getHistory(thread.thread_id, { limit: 100 })).length).toBe(1);
@@ -133,12 +133,12 @@ test("keep_latest leaves interrupted native pending writes usable for HITL resum
     const thread = await client.threads.create();
     await client.runs.wait(thread.thread_id, "approval", { input: { proposal: "ship" } });
     expect((await client.threads.getState(thread.thread_id)).next.length).toBeGreaterThan(0);
-    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
-    expect(await count(runtime, "lg_writes", thread.thread_id)).toBeGreaterThan(0);
+    expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBeGreaterThan(1);
+    expect(await count(runtime, "lg_checkpoint_writes", thread.thread_id)).toBeGreaterThan(0);
     expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
       .toMatchObject({ pruned_count: 1 });
-    expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
-    expect(await count(runtime, "lg_writes", thread.thread_id)).toBeGreaterThan(0);
+    expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBe(1);
+    expect(await count(runtime, "lg_checkpoint_writes", thread.thread_id)).toBeGreaterThan(0);
     const resumed = await client.runs.wait(thread.thread_id, "approval", {
       command: { resume: { decisions: [{ type: "approve" }] } },
     });
@@ -198,10 +198,10 @@ if (process.env.VALIDA_TEST_POSTGRES_URL) {
       try {
         await client.runs.wait(thread.thread_id, "counter", { input: { count: 1 } });
         await client.runs.wait(thread.thread_id, "counter", { input: {} });
-        expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBeGreaterThan(1);
+        expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBeGreaterThan(1);
         expect(await client.threads.prune([thread.thread_id], { strategy: "keep_latest" }))
           .toMatchObject({ pruned_count: 1 });
-        expect(await count(runtime, "lg_checkpoints", thread.thread_id)).toBe(1);
+        expect(await count(runtime, "lg_checkpoints_v2", thread.thread_id)).toBe(1);
         expect((await client.threads.getState(thread.thread_id)).values).toMatchObject({ count: 3 });
         expect(await client.runs.wait(thread.thread_id, "counter", { input: {} })).toMatchObject({ count: 4 });
       } finally {

@@ -7,6 +7,7 @@ import { RunQueue, type QueueConfig } from "../queue/index.js";
 import { DrizzleCheckpointer } from "./checkpointer.js";
 import { V1TraceHandler } from "./v1_callbacks.js";
 import { RunEventLog, type RunEvent } from "./events.js";
+import { migrateLegacyCheckpoints } from "./legacy_checkpoints.js";
 import { toWire } from "./wire.js";
 export { toWire } from "./wire.js";
 
@@ -342,6 +343,7 @@ export class GraphRuntime {
     this.active.add(runId);
     let releaseSlot: (() => void) | undefined;
     let threadId: string | undefined;
+    let queuedOn: string | undefined;
     try {
       let recovering = false;
       for (;;) {
@@ -358,7 +360,7 @@ export class GraphRuntime {
         recovering = current.status === "running";
         if (await this.store.claimRun(runId, this.runLeaseMs)) break;
         // Queued behind another run of its thread: that run dispatches it when it ends.
-        if (current.status === "pending") return;
+        if (current.status === "pending") { queuedOn = current.threadId; return; }
         // A stalled BullMQ job may be retried before its database lease expires.
         // Keep the replacement job alive until the owner finishes or the lease expires.
         releaseSlot();
@@ -440,6 +442,8 @@ export class GraphRuntime {
         console.warn(`Could not persist events of run ${runId}: ${String(error)} ${String((error as { cause?: unknown })?.cause ?? "")}`));
       this.active.delete(runId);
       if (threadId) await this.dispatchNext(threadId).catch(() => {});
+      // The predecessor may have ended while this attempt was still active and skipped it.
+      if (queuedOn) await this.dispatchNext(queuedOn).catch(() => {});
     }
   }
 
@@ -451,8 +455,10 @@ export class GraphRuntime {
 
   /** Start the oldest run waiting on a thread once the thread's active run is over. */
   private async dispatchNext(threadId: string): Promise<void> {
-    const [next] = await this.store.listActiveRuns(threadId);
-    if (next?.status === "pending" && !this.active.has(next.id)) await this.dispatch(next.id);
+    const active = await this.store.listActiveRuns(threadId);
+    if (active.some(run => run.status === "running")) return;
+    const next = active[0];
+    if (next && !this.active.has(next.id)) await this.dispatch(next.id);
   }
 
   private async fail(run: RunRecord, error: unknown): Promise<void> {
@@ -812,5 +818,8 @@ export class GraphRuntime {
 }
 
 export async function createRuntime(config: RuntimeConfig): Promise<GraphRuntime> {
-  return new GraphRuntime(await createStore(config.db), config);
+  const runtime = new GraphRuntime(await createStore(config.db), config);
+  // Checkpoints from the previous storage layout are moved before any run can read them.
+  await migrateLegacyCheckpoints(runtime.store, runtime.checkpointer);
+  return runtime;
 }
