@@ -40,6 +40,13 @@ function multitaskStrategy(value: unknown): MultitaskStrategy {
   if (MULTITASK_STRATEGIES.includes(value as MultitaskStrategy)) return value as MultitaskStrategy;
   throw new ApiError(422, `Invalid multitask_strategy '${String(value)}'`);
 }
+function streamModes(value: unknown): string[] {
+  let raw = value;
+  if (typeof raw === "string") {
+    try { raw = raw.startsWith("[") ? JSON.parse(raw) : raw.split(","); } catch { return []; }
+  }
+  return Array.isArray(raw) ? raw.filter((mode): mode is string => typeof mode === "string").map(mode => mode.trim()) : [];
+}
 const object = (value: unknown): JsonRecord =>
   value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : {};
 const number = (value: unknown, fallback: number) => {
@@ -431,6 +438,9 @@ export function createPlatformAdapter(
         } });
         const command = object(payload.command);
         const metadata = publicEntries(payload.metadata);
+        // The engine keeps a run's events for the stream modes it was created with; LangGraph defaults to values.
+        const modes = payload.stream_mode == null ? ["values"] : streamModes(payload.stream_mode);
+        if (modes.length) metadata.__stream_modes = modes;
         const traceContext = runtime.captureTraceContext?.();
         if (traceContext?.traceparent) metadata.__trace_context = traceContext;
         const resumed = payload.command != null || (payload.input && object(payload.input).respond !== undefined);
