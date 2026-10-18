@@ -6,6 +6,14 @@ namespace and key. Namespace listing, exact metadata filtering, pagination,
 and item TTL work without an index. A semantic `query` returns HTTP 501 when
 no index is configured.
 
+`createLangGraphStore(store)` from `langgraph_store.ts` exposes those same items
+through LangGraph's native `BaseStore` interface. Pass it as `store` to LangChain
+`createAgent` or a compiled LangGraph. It supports get/put/delete, search filters,
+namespace matching, pagination and ordered batch operations; timestamps are
+converted to the `Date` objects expected by LangGraph. The Agent Protocol Store
+API and native agents share the same tables and authorization filters. No data
+migration or second memory database is required.
+
 Set `store.index` in `valida.json` to enable semantic search:
 
 ```json
